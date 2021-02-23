@@ -58,7 +58,7 @@ struct tcp_frame_t {
 	uint16_t src_port;
 	uint16_t dst_port;
 	uint32_t sequence_number;
-	uint32_t ack_number;
+	uint32_t acknowledgment_number;
 	uint16_t flags;
 	uint16_t window_size_value;
 	uint16_t checksum;
@@ -250,8 +250,21 @@ void set_ip_checksum(struct ip_frame_t *ip)
 	write_s(&ip->checksum, sum);
 }
 
-void set_tcp_checksum(struct tcp_frame_t *tcp, int len, struct ip_frame_t const *ip)
+void set_checksum_(struct ip_frame_t const *ip, int len)
 {
+	struct tcp_frame_t *tcp = NULL;
+	struct udp_frame_t *udp = NULL;
+	if (ip->protocol == 6) { // TCP
+		tcp = (struct tcp_frame_t *)((uint8_t *)ip + sizeof(struct ip_frame_t));
+		tcp->checksum = 0;
+	} else if (ip->protocol == 17) { // UDP
+		udp = (struct udp_frame_t *)((uint8_t *)ip + sizeof(struct ip_frame_t));
+		len = ntohs(udp->length);
+		udp->checksum = 0;
+	} else {
+		return;
+	}
+
 	struct {
 		uint32_t src;
 		uint32_t dst;
@@ -260,9 +273,6 @@ void set_tcp_checksum(struct tcp_frame_t *tcp, int len, struct ip_frame_t const 
 		uint16_t length;
 	} header;
 	uint16_t sum;
-//	int len = read_s(&tcp->length);
-
-	tcp->checksum = 0;
 
 	header.src = ip->src;
 	header.dst = ip->dst;
@@ -271,41 +281,26 @@ void set_tcp_checksum(struct tcp_frame_t *tcp, int len, struct ip_frame_t const 
 	write_s(&header.length, len);
 
 	sum = compute_sum(0, &header, sizeof(header));
-	sum = compute_sum(sum, tcp, len);
+	if (tcp) sum = compute_sum(sum, tcp, len);
+	if (udp) sum = compute_sum(sum, udp, len);
+
 	sum = ~sum;
 	if (sum == 0) {
 		sum = 0xffff;
 	}
-	write_s(&tcp->checksum, sum);
+
+	if (tcp) write_s(&tcp->checksum, sum);
+	if (udp) write_s(&udp->checksum, sum);
 }
 
-void set_udp_checksum(struct udp_frame_t *udp, struct ip_frame_t const *ip)
+void set_tcp_checksum(struct ip_frame_t const *ip, int len)
 {
-	struct {
-		uint32_t src;
-		uint32_t dst;
-		uint8_t zero;
-		uint8_t protocol;
-		uint16_t length;
-	} header;
-	uint16_t sum;
-	int len = read_s(&udp->length);
+	set_checksum_(ip, len);
+}
 
-	udp->checksum = 0;
-
-	header.src = ip->src;
-	header.dst = ip->dst;
-	header.zero = 0;
-	header.protocol = ip->protocol;
-	write_s(&header.length, len);
-
-	sum = compute_sum(0, &header, sizeof(header));
-	sum = compute_sum(sum, udp, len);
-	sum = ~sum;
-	if (sum == 0) {
-		sum = 0xffff;
-	}
-	write_s(&udp->checksum, sum);
+void set_udp_checksum(struct ip_frame_t const *ip)
+{
+	set_checksum_(ip, 0);
 }
 
 void set_icmp_checksum(struct icmp_frame_t *icmp, struct ip_frame_t const *ip)
@@ -393,7 +388,7 @@ static void send_dhcp_packet(struct dhcp_header_frame_t *frame, uint8_t *begin, 
 	};
 	prepare_udp_packet(&frame->header, dstaddr, 67, 68, end);
 	prepare_ip_packet(&frame->header.ip, end);
-	set_udp_checksum(&frame->header.udp, &frame->header.ip);
+	set_udp_checksum(&frame->header.ip);
 	set_ip_checksum(&frame->header.ip);
 	eth_send_packet(begin, end - begin);
 }
@@ -925,7 +920,7 @@ found:;
 	return true;
 }
 
-bool send_ip_packet(uint8_t *packet, int length, uint16_t flags)
+bool send_ip_packet(uint8_t *packet, int length)
 {
 	struct frame_t {
 		struct ethernet_frame_t eth;
@@ -959,9 +954,11 @@ bool send_ip_packet(uint8_t *packet, int length, uint16_t flags)
 
 	set_ip_identifier(&frame->ip);
 
-	if (frame->ip.protocol == 17) {
-		struct udp_frame_t *udp = (struct udp_frame_t *)(packet + sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t));
-		set_udp_checksum(udp, &frame->ip);
+	if (frame->ip.protocol == 6) { // TCP
+		int n = length - (sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t));
+		set_tcp_checksum(&frame->ip, n);
+	} else if (frame->ip.protocol == 17) { // UDP
+		set_udp_checksum(&frame->ip);
 	}
 
 	prepare_ip_packet(&frame->ip, packet + length);
@@ -986,7 +983,7 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 
 	prepare_udp_packet((struct eth_ip_udp_frame_t *)tmp, dstipv4, dstport, srcport, p);
 
-	return send_ip_packet(tmp, p - tmp, 0);
+	return send_ip_packet(tmp, p - tmp);
 }
 
 void lcd_print_ipv4(uint32_t ipv4);
@@ -1009,12 +1006,12 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth)
 		struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
 		uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
 
-//		static char opt[] = {
-//			0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x08, 0x0a, 0x6a, 0xcf, 0xc0, 0x59, 0x00, 0x00, 0x00, 0x00,
-//			0x01, 0x03, 0x03, 0x07
-//		};
-//		memcpy(end, opt, 20);
-//		end += 20;
+		static char opt[] = {
+			0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x08, 0x0a, 0x6a, 0xcf, 0xc0, 0x59, 0x00, 0x00, 0x00, 0x00,
+			0x01, 0x03, 0x03, 0x07
+		};
+		memcpy(end, opt, 20);
+		end += 20;
 
 		int len = end - (uint8_t *)&frame->ip;
 
@@ -1022,15 +1019,15 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth)
 		frame->ip.protocol = 6; // TCP
 		write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
 		frame->ip.dst = eth->ip.src;
-		frame->tcp.flags = htons(((end - (uint8_t *)&frame->tcp) << 10) | 0x12); // ACK SYN
+		write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x12); // ACK SYN
 		frame->tcp.src_port = eth->tcp.dst_port;
 		frame->tcp.dst_port = eth->tcp.src_port;
-		frame->tcp.sequence_number = eth->tcp.sequence_number; // ?
-		frame->tcp.ack_number = htonl(0);
+		frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
+		frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
+		write_s(&frame->tcp.window_size_value, 10000);
 		frame->tcp.urgent_pointer = 0;
 
-		set_tcp_checksum(&frame->tcp, len, &frame->ip);
-		return send_ip_packet(tmp, end - tmp, 0x4000);
+		return send_ip_packet(tmp, end - tmp);
 	} else {
 		if (len >= sizeof(struct udp_frame_t) && len <= MAX_FRAME_SIZE && ip_stack_globals.udp_packet_count < UDP_PACKET_BUFFER_SIZE) {
 			struct packet_header_t *packet = (struct packet_header_t *)malloc(sizeof(struct packet_header_t) + len);
@@ -1318,7 +1315,7 @@ bool query_dns(char const *name, uint8_t *ipv4)
 			}
 			write_s(&item->transaction_id, ip_stack_globals.dns_transaction_id);
 			ip_stack_globals.dns_transaction_id++;
-			if (!send_ip_packet(tmp, packetlength, 0)) {
+			if (!send_ip_packet(tmp, packetlength)) {
 				return false;
 			}
 			tick = milliseconds();
