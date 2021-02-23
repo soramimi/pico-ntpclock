@@ -3,9 +3,10 @@
  * MIT License
  */
 
-#include "enc28j60.h"
-#include "ip.h"
 #include "pico/stdlib.h"
+#include "enc28j60.h"
+#include "enc28j60io.h"
+#include "ip.h"
 
 uint16_t _enc28j60_next_packet_ptr;
 

@@ -8,11 +8,6 @@
 
 #include <stdint.h>
 
-uint32_t milliseconds();
-void enc28j60_init_io();
-void enc28j60_cs(int f);
-int enc28j60_io(int v);
-
 void enc28j60_init(uint8_t const *macaddr);
 int enc28j60_peek_packet();
 void enc28j60_drop_packet();

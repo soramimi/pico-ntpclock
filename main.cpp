@@ -5,11 +5,15 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 
+extern "C" {
 #include "lcd.h"
 #include "ip.h"
+}
 
 #define TIMEZONE (9 * 60 * 60)
 #define NTP_SERVER "ntp.nict.jp"
@@ -47,7 +51,7 @@ void send_ntp_request(uint8_t const *ntp_server_addr)
 	send_udp_packet(ntp_server_addr, 123, 1024, data, sizeof(data));
 }
 
-bool parse_ntp_packet(struct packet_header_t *packet, unsigned long *p_s, int *p_ms)
+bool parse_ntp_packet(struct packet_header_t *packet, uint32_t *p_s, uint16_t *p_ms)
 {
 	if (!packet) {
 		return false;
@@ -139,7 +143,7 @@ uint32_t get_time()
 
 //
 
-int main()
+extern "C" int main()
 {
 	uint32_t now = 0;
 	bool valid_time = false;
@@ -189,6 +193,15 @@ int main()
 
 	if (!gethostbyname(NTP_SERVER, ntp_server_addr)) {
 		giveup("Resolve error");
+	}
+
+	{
+		uint8_t ipv4[4];
+		ip_get_address(ipv4);
+		char tmp[100];
+		sprintf(tmp, "%d.%d.%d.%d", ipv4[0], ipv4[1], ipv4[2], ipv4[3]);
+		lcd_set_cursor(1, 0);
+		lcd_print(tmp);
 	}
 
 	//

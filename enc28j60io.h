@@ -14,6 +14,7 @@ extern "C" {
 #endif
 
 uint32_t milliseconds();
+void enc28j60_init_io();
 void enc28j60_cs(bool f);
 int enc28j60_io(uint8_t c);
 

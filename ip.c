@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "pico/stdlib.h"
 
 #define MAX_FRAME_SIZE 1518
 
@@ -22,12 +23,12 @@ uint16_t htons(uint16_t v)
 
 uint32_t ntohl(uint32_t v)
 {
-	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff00) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
+	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff0000) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
 }
 
 uint32_t htonl(uint32_t v)
 {
-	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff00) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
+	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff0000) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
 }
 
 //
@@ -51,6 +52,17 @@ struct ip_frame_t {
 	uint16_t checksum;
 	uint32_t src;
 	uint32_t dst;
+} __attribute__ ((packed));
+
+struct tcp_frame_t {
+	uint16_t src_port;
+	uint16_t dst_port;
+	uint32_t sequence_number;
+	uint32_t ack_number;
+	uint16_t flags;
+	uint16_t window_size_value;
+	uint16_t checksum;
+	uint16_t urgent_pointer;
 } __attribute__ ((packed));
 
 struct udp_frame_t {
@@ -238,6 +250,35 @@ void set_ip_checksum(struct ip_frame_t *ip)
 	write_s(&ip->checksum, sum);
 }
 
+void set_tcp_checksum(struct tcp_frame_t *tcp, int len, struct ip_frame_t const *ip)
+{
+	struct {
+		uint32_t src;
+		uint32_t dst;
+		uint8_t zero;
+		uint8_t protocol;
+		uint16_t length;
+	} header;
+	uint16_t sum;
+//	int len = read_s(&tcp->length);
+
+	tcp->checksum = 0;
+
+	header.src = ip->src;
+	header.dst = ip->dst;
+	header.zero = 0;
+	header.protocol = ip->protocol;
+	write_s(&header.length, len);
+
+	sum = compute_sum(0, &header, sizeof(header));
+	sum = compute_sum(sum, tcp, len);
+	sum = ~sum;
+	if (sum == 0) {
+		sum = 0xffff;
+	}
+	write_s(&tcp->checksum, sum);
+}
+
 void set_udp_checksum(struct udp_frame_t *udp, struct ip_frame_t const *ip)
 {
 	struct {
@@ -287,6 +328,12 @@ void set_ip_identifier(struct ip_frame_t *ip)
 	ip_stack_globals.ip_identifier++;
 }
 
+struct eth_ip_tcp_frame_t {
+	struct ethernet_frame_t eth;
+	struct ip_frame_t ip;
+	struct tcp_frame_t tcp;
+}  __attribute__ ((packed));
+
 struct eth_ip_udp_frame_t {
 	struct ethernet_frame_t eth;
 	struct ip_frame_t ip;
@@ -295,11 +342,21 @@ struct eth_ip_udp_frame_t {
 
 void prepare_ip_packet(struct ip_frame_t *ip, void *end)
 {
-	uint16_t len = (uint8_t const *)end - (uint8_t const*)ip;
 	ip->version_and_length = 0x45; // version=4; length=20
 	set_ip_identifier(ip);
-	ip->time_to_live = 128;
-	write_s(&ip->total_length, len);
+	ip->time_to_live = 64;
+	if (end) {
+		uint16_t len = (uint8_t const *)end - (uint8_t const*)ip;
+		write_s(&ip->total_length, len);
+	}
+}
+
+void prepare_tcp_packet(struct eth_ip_tcp_frame_t *frame, uint32_t dstipv4, uint16_t dstport, uint16_t srcport)
+{
+	frame->ip.protocol = 6;
+	frame->ip.dst = dstipv4;
+	write_s(&frame->tcp.dst_port, dstport);
+	write_s(&frame->tcp.src_port, srcport);
 }
 
 void prepare_udp_packet(struct eth_ip_udp_frame_t *frame, uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport, void *end)
@@ -813,6 +870,184 @@ void process_dns_response(struct dns_frame_t const *dns, uint8_t const *end)
 	}
 }
 
+static void arp_cache_move_to_front(int i)
+{
+	if (i < 1 || i >= ARP_CACHE_SIZE) {
+		return;
+	}
+	struct arp_cache_item_t item;
+	memcpy(&item, &ip_stack_globals.arp_cache[i], sizeof(struct arp_cache_item_t));
+	memmove(ip_stack_globals.arp_cache + 1, ip_stack_globals.arp_cache, sizeof(struct arp_cache_item_t) * i);
+	memcpy(&ip_stack_globals.arp_cache[i], &item, sizeof(struct arp_cache_item_t));
+}
+
+int find_mac_from_arp_cache(uint8_t const *ipv4)
+{
+	int i;
+	for (i = 0; i < ARP_CACHE_SIZE; i++) {
+		if (ip_stack_globals.arp_cache[i].valid && memcmp(ip_stack_globals.arp_cache[i].ipv4, ipv4, 4) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+bool get_mac_from_ipv4(uint8_t const *ipv4, uint8_t *mac)
+{
+	int i;
+	int retry;
+	i = find_mac_from_arp_cache(ipv4);
+	if (i >= 0) {
+		goto found;
+	}
+	retry = 0;
+	while (1) {
+		uint32_t start_tick = milliseconds();
+		send_arp_request(ipv4);
+		while (1) {
+			if (milliseconds() - start_tick > 1000) {
+				break;
+			}
+			ip_stack_process();
+			i = find_mac_from_arp_cache(ipv4);
+			if (i >= 0) {
+				goto found;
+			}
+		}
+		retry++;
+		if (retry >= 5) {
+			return false;
+		}
+	}
+found:;
+	memcpy(mac, ip_stack_globals.arp_cache[i].mac, 6);
+	arp_cache_move_to_front(i);
+	return true;
+}
+
+bool send_ip_packet(uint8_t *packet, int length, uint16_t flags)
+{
+	struct frame_t {
+		struct ethernet_frame_t eth;
+		struct ip_frame_t ip;
+	} *frame;
+
+	if (length < sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t)) {
+		return false;
+	}
+
+	frame = (struct frame_t *)packet;
+
+	memcpy(frame->eth.src, ip_stack_globals.mac_addr, 6);
+
+	if ((frame->ip.dst & get_ip_subnet_mask()) == (get_ip_address() & get_ip_subnet_mask())) {
+		if (!get_mac_from_ipv4((uint8_t const *)&frame->ip.dst, frame->eth.dst)) {
+			return false;
+		}
+	} else if (frame->ip.dst == 0xffffffff) {
+		memset(frame->eth.dst, 0xff, 6);
+	} else {
+		if (!get_mac_from_ipv4(ip_stack_globals.gateway_addr, frame->eth.dst)) {
+			return false;
+		}
+	}
+
+	memcpy(&frame->ip.src, ip_stack_globals.ipv4_addr, 4);
+	write_s(&frame->eth.type, 0x0800);
+
+	write_s(&frame->ip.total_length, length - sizeof(struct ethernet_frame_t));
+
+	set_ip_identifier(&frame->ip);
+
+	if (frame->ip.protocol == 17) {
+		struct udp_frame_t *udp = (struct udp_frame_t *)(packet + sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t));
+		set_udp_checksum(udp, &frame->ip);
+	}
+
+	prepare_ip_packet(&frame->ip, packet + length);
+
+	set_ip_checksum(&frame->ip);
+	eth_send_packet(packet, length);
+
+	return true;
+}
+
+bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport, uint8_t const *ptr, uint16_t len)
+{
+	uint8_t tmp[MAX_FRAME_SIZE];
+
+	if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
+		return false;
+	}
+
+	uint8_t *p = tmp + sizeof(struct eth_ip_udp_frame_t);
+	memcpy(p, ptr, len);
+	p += len;
+
+	prepare_udp_packet((struct eth_ip_udp_frame_t *)tmp, dstipv4, dstport, srcport, p);
+
+	return send_ip_packet(tmp, p - tmp, 0);
+}
+
+void lcd_print_ipv4(uint32_t ipv4);
+
+void on_tcp_packet(struct eth_ip_tcp_frame_t *eth)
+{
+//	struct ip_frame_t const *ip, struct tcp_frame_t const *tcp
+	uint16_t flags = read_s(&eth->tcp.flags);
+	uint8_t len = flags >> 10;
+	uint8_t const *end = (uint8_t const *)&eth->tcp;
+	end += len;
+	if ((flags & 0x0017) == 0x0002) { // SYN
+		uint8_t tmp[MAX_FRAME_SIZE];
+
+		if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
+			return false;
+		}
+
+		memset(tmp, 0, sizeof(tmp));
+		struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
+		uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
+
+//		static char opt[] = {
+//			0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x08, 0x0a, 0x6a, 0xcf, 0xc0, 0x59, 0x00, 0x00, 0x00, 0x00,
+//			0x01, 0x03, 0x03, 0x07
+//		};
+//		memcpy(end, opt, 20);
+//		end += 20;
+
+		int len = end - (uint8_t *)&frame->ip;
+
+		prepare_ip_packet(&frame->ip, NULL);
+		frame->ip.protocol = 6; // TCP
+		write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
+		frame->ip.dst = eth->ip.src;
+		frame->tcp.flags = htons(((end - (uint8_t *)&frame->tcp) << 10) | 0x12); // ACK SYN
+		frame->tcp.src_port = eth->tcp.dst_port;
+		frame->tcp.dst_port = eth->tcp.src_port;
+		frame->tcp.sequence_number = eth->tcp.sequence_number; // ?
+		frame->tcp.ack_number = htonl(0);
+		frame->tcp.urgent_pointer = 0;
+
+		set_tcp_checksum(&frame->tcp, len, &frame->ip);
+		return send_ip_packet(tmp, end - tmp, 0x4000);
+	} else {
+		if (len >= sizeof(struct udp_frame_t) && len <= MAX_FRAME_SIZE && ip_stack_globals.udp_packet_count < UDP_PACKET_BUFFER_SIZE) {
+			struct packet_header_t *packet = (struct packet_header_t *)malloc(sizeof(struct packet_header_t) + len);
+			if (!packet) {
+				// not enough memory ?
+				return;
+			}
+			memcpy(packet->src_addr, &eth->ip.src, 4);
+			packet->src_port = read_s(&eth->tcp.src_port);
+			packet->dst_port = read_s(&eth->tcp.dst_port);
+			packet->length = len - sizeof(struct udp_frame_t);
+//			memcpy(packet->data, p, packet->length);
+//			ip_stack_globals.udp_packets[ip_stack_globals.udp_packet_count++] = packet;
+		}
+	}
+}
+
 void on_udp_packet(struct ip_frame_t const *ip, uint8_t *p, bool broadcast)
 {
 	struct udp_frame_t *udp = (struct udp_frame_t *)p;
@@ -851,11 +1086,16 @@ void eth_on_ip_packet(uint8_t *buf, int len, bool broadcast)
 	if ((ip->version_and_length & 0xf0) == 0x40) {
 		uint8_t *p = (uint8_t *)ip;
 		p += (ip->version_and_length & 0x0f) * 4;
-		if (ip->protocol == 17) {
+		if (ip->protocol == 6) { // TCP
+			struct eth_ip_tcp_frame_t *eth = (struct eth_ip_tcp_frame_t *)buf;
+			on_tcp_packet(eth);
+			return;
+		}
+		if (ip->protocol == 17) { // UDP
 			on_udp_packet(ip, p, broadcast);
 			return;
 		}
-		if (ip->protocol == 1) {
+		if (ip->protocol == 1) { // ICMP
 			struct ethernet_frame_t const *eth = (struct ethernet_frame_t *)buf;
 			on_icmp_packet(eth, ip, p, broadcast);
 			return;
@@ -924,71 +1164,16 @@ void ip_stack_process()
 		} else if (memcmp(eth->dst, ip_stack_globals.mac_addr, 6) != 0) {
 			continue;
 		}
-		uint16_t type =ntohs(eth->type);
-		if (type == 0x0800) {
+		uint16_t type = ntohs(eth->type);
+		if (type == 0x0800) { // IPv4
 			eth_on_ip_packet(tmp, len, broadcast);
 			continue;
 		}
-		if (type == 0x0806) {
+		if (type == 0x0806) { // ARP
 			eth_on_arp_packet(tmp, len, broadcast);
 			continue;
 		}
 	}
-}
-
-static void arp_cache_move_to_front(int i)
-{
-	if (i < 1 || i >= ARP_CACHE_SIZE) {
-		return;
-	}
-	struct arp_cache_item_t item;
-	memcpy(&item, &ip_stack_globals.arp_cache[i], sizeof(struct arp_cache_item_t));
-	memmove(ip_stack_globals.arp_cache + 1, ip_stack_globals.arp_cache, sizeof(struct arp_cache_item_t) * i);
-	memcpy(&ip_stack_globals.arp_cache[i], &item, sizeof(struct arp_cache_item_t));
-}
-
-int find_mac_from_arp_cache(uint8_t const *ipv4)
-{
-	int i;
-	for (i = 0; i < ARP_CACHE_SIZE; i++) {
-		if (ip_stack_globals.arp_cache[i].valid && memcmp(ip_stack_globals.arp_cache[i].ipv4, ipv4, 4) == 0) {
-			return i;
-		}
-	}
-	return -1;
-}
-
-bool get_mac_from_ipv4(uint8_t const *ipv4, uint8_t *mac)
-{
-	int i;
-	int retry;
-	i = find_mac_from_arp_cache(ipv4);
-	if (i >= 0) {
-		goto found;
-	}
-	retry = 0;
-	while (1) {
-		uint32_t start_tick = milliseconds();
-		send_arp_request(ipv4);
-		while (1) {
-			if (milliseconds() - start_tick > 1000) {
-				break;
-			}
-			ip_stack_process();
-			i = find_mac_from_arp_cache(ipv4);
-			if (i >= 0) {
-				goto found;
-			}
-		}
-		retry++;
-		if (retry >= 5) {
-			return false;
-		}
-	}
-found:;
-	memcpy(mac, ip_stack_globals.arp_cache[i].mac, 6);
-	arp_cache_move_to_front(i);
-	return true;
 }
 
 void ip_config(uint8_t const *ipv4, uint8_t const *mask, uint8_t const *gateway, uint8_t const *dns)
@@ -1024,72 +1209,9 @@ bool ip_config_with_dhcp()
 	return false;
 }
 
-bool send_ip_packet(uint8_t *packet, int length)
+void ip_get_address(uint8_t *ipv4)
 {
-	struct frame_t {
-		struct ethernet_frame_t eth;
-		struct ip_frame_t ip;
-	} *frame;
-
-	if (length < sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t)) {
-		return false;
-	}
-
-	frame = (struct frame_t *)packet;
-
-	memcpy(frame->eth.src, ip_stack_globals.mac_addr, 6);
-
-	frame->ip.version_and_length = 0x45; // version=4; length=20
-	write_s(&frame->ip.flags_and_fragment_offset, 0);
-	frame->ip.time_to_live = 64;
-
-	if ((frame->ip.dst & get_ip_subnet_mask()) == (get_ip_address() & get_ip_subnet_mask())) {
-		if (!get_mac_from_ipv4((uint8_t const *)&frame->ip.dst, frame->eth.dst)) {
-			return false;
-		}
-	} else if (frame->ip.dst == 0xffffffff) {
-		memset(frame->eth.dst, 0xff, 6);
-	} else {
-		if (!get_mac_from_ipv4(ip_stack_globals.gateway_addr, frame->eth.dst)) {
-			return false;
-		}
-	}
-
-	memcpy(&frame->ip.src, ip_stack_globals.ipv4_addr, 4);
-	write_s(&frame->eth.type, 0x0800);
-
-	write_s(&frame->ip.total_length, length - sizeof(struct ethernet_frame_t));
-
-	set_ip_identifier(&frame->ip);
-
-	if (frame->ip.protocol == 17) {
-		struct udp_frame_t *udp = (struct udp_frame_t *)(packet + sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t));
-		set_udp_checksum(udp, &frame->ip);
-	}
-
-	prepare_ip_packet(&frame->ip, packet + length);
-
-	set_ip_checksum(&frame->ip);
-	eth_send_packet(packet, length);
-
-	return true;
-}
-
-bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport, uint8_t const *ptr, uint16_t len)
-{
-	uint8_t tmp[MAX_FRAME_SIZE];
-
-	if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
-		return false;
-	}
-
-	uint8_t *p = tmp + sizeof(struct eth_ip_udp_frame_t);
-	memcpy(p, ptr, len);
-	p += len;
-
-	prepare_udp_packet((struct eth_ip_udp_frame_t *)tmp, dstipv4, dstport, srcport, p);
-
-	return send_ip_packet(tmp, p - tmp);
+	memcpy(ipv4, ip_stack_globals.ipv4_addr, 4);
 }
 
 struct packet_header_t *take_udp_packet()
@@ -1196,7 +1318,7 @@ bool query_dns(char const *name, uint8_t *ipv4)
 			}
 			write_s(&item->transaction_id, ip_stack_globals.dns_transaction_id);
 			ip_stack_globals.dns_transaction_id++;
-			if (!send_ip_packet(tmp, packetlength)) {
+			if (!send_ip_packet(tmp, packetlength, 0)) {
 				return false;
 			}
 			tick = milliseconds();

@@ -13,7 +13,7 @@ pico_sdk_init()
 
 
 add_executable($ENV{NAME}
-        main.c
+        main.cpp
 	lcd.c
         enc28j60io.c
         enc28j60.c
