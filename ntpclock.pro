@@ -28,6 +28,6 @@ SOURCES += \
            build/elf2uf2/CMakeFiles/3.16.3/CompilerIdCXX/CMakeCXXCompilerId.cpp \
            enc28j60.c \
            enc28j60io.c \
-           ip.c \
+           ip.cpp \
            lcd.c \
            main.cpp

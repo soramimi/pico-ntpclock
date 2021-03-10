@@ -169,19 +169,19 @@ extern "C" int main()
 
 	ip_stack_init(macaddr);
 
-#if 0
+#if 1
 	{
 		uint8_t ip_address[] = {
-			192, 168, 0, 100
+			10, 10, 10, 100
 		};
 		uint8_t subnet_mask[] = {
 			255, 255, 255, 0
 		};
 		uint8_t gateway_addr[] = {
-			192, 168, 0, 1
+			10, 10, 10, 1
 		};
 		uint8_t dns_server[] = {
-			192, 168, 0, 1
+			10, 10, 10, 1
 		};
 		ip_config(ip_address, subnet_mask, gateway_addr, dns_server);
 	}

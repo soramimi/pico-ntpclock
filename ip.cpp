@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "pico/stdlib.h"
+#include <vector>
 
 #define MAX_FRAME_SIZE 1518
 
@@ -143,6 +144,11 @@ struct dns_cache_item_t {
 	char name[1];
 };
 
+struct tcp_connection_t {
+	uint16_t port = 0;
+	bool fin = false;
+};
+
 struct ip_stack_globals_t {
 	uint16_t packet_id;
 	uint8_t mac_addr[6];
@@ -158,6 +164,7 @@ struct ip_stack_globals_t {
 	uint16_t udp_packet_count;
 	int dhcp_ack_waiting;
 	int state;
+	std::vector<tcp_connection_t> tcp_connections;
 } ip_stack_globals;
 
 
@@ -988,34 +995,79 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 
 void lcd_print_ipv4(uint32_t ipv4);
 
-void on_tcp_packet(struct eth_ip_tcp_frame_t *eth)
+void tcp_send_fin(struct eth_ip_tcp_frame_t *eth, tcp_connection_t *conn)
 {
+	uint8_t tmp[MAX_FRAME_SIZE];
+
+	memset(tmp, 0, sizeof(tmp));
+	struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
+	uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
+
+	prepare_ip_packet(&frame->ip, nullptr);
+	frame->ip.protocol = 6; // TCP
+	write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
+	frame->ip.dst = eth->ip.src;
+	write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x11); // FIN ACK
+	frame->tcp.src_port = eth->tcp.dst_port;
+	frame->tcp.dst_port = eth->tcp.src_port;
+	frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
+	frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
+	write_s(&frame->tcp.window_size_value, 10000);
+	frame->tcp.urgent_pointer = 0;
+
+	conn->fin = true;
+
+	send_ip_packet(tmp, end - tmp);
+}
+
+tcp_connection_t *find_tcp_connection(eth_ip_tcp_frame_t *eth)
+{
+	for (tcp_connection_t &c : ip_stack_globals.tcp_connections) {
+		if (c.port == ntohs(eth->tcp.dst_port)) {
+			return &c;
+		}
+	}
+	return nullptr;
+}
+
+void dispose_tcp_session(tcp_connection_t *conn)
+{
+	if (conn) {
+		for (size_t i = 0; i < ip_stack_globals.tcp_connections.size(); i++) {
+			tcp_connection_t *c = &ip_stack_globals.tcp_connections[i];
+			if (c == conn) {
+				ip_stack_globals.tcp_connections.erase(ip_stack_globals.tcp_connections.begin() + i);
+				break;
+			}
+		}
+	}
+}
+
+void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
+{
+	uint8_t tmp[MAX_FRAME_SIZE];
+
 //	struct ip_frame_t const *ip, struct tcp_frame_t const *tcp
 	uint16_t flags = read_s(&eth->tcp.flags);
 	uint8_t len = flags >> 10;
 	uint8_t const *end = (uint8_t const *)&eth->tcp;
 	end += len;
+	if (flags & 0x0004) { // RST
+		tcp_connection_t *conn = find_tcp_connection(eth);
+		dispose_tcp_session(conn);
+		return; // true
+	}
 	if ((flags & 0x0017) == 0x0002) { // SYN
-		uint8_t tmp[MAX_FRAME_SIZE];
 
 		if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
-			return false;
+			return; // false
 		}
 
 		memset(tmp, 0, sizeof(tmp));
 		struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
 		uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
 
-		static char opt[] = {
-			0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x08, 0x0a, 0x6a, 0xcf, 0xc0, 0x59, 0x00, 0x00, 0x00, 0x00,
-			0x01, 0x03, 0x03, 0x07
-		};
-		memcpy(end, opt, 20);
-		end += 20;
-
-		int len = end - (uint8_t *)&frame->ip;
-
-		prepare_ip_packet(&frame->ip, NULL);
+		prepare_ip_packet(&frame->ip, nullptr);
 		frame->ip.protocol = 6; // TCP
 		write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
 		frame->ip.dst = eth->ip.src;
@@ -1027,22 +1079,80 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth)
 		write_s(&frame->tcp.window_size_value, 10000);
 		frame->tcp.urgent_pointer = 0;
 
-		return send_ip_packet(tmp, end - tmp);
-	} else {
-		if (len >= sizeof(struct udp_frame_t) && len <= MAX_FRAME_SIZE && ip_stack_globals.udp_packet_count < UDP_PACKET_BUFFER_SIZE) {
-			struct packet_header_t *packet = (struct packet_header_t *)malloc(sizeof(struct packet_header_t) + len);
-			if (!packet) {
-				// not enough memory ?
-				return;
+		tcp_connection_t conn;
+		conn.port = ntohs(eth->tcp.dst_port);
+		ip_stack_globals.tcp_connections.push_back(conn);
+
+		send_ip_packet(tmp, end - tmp);
+		return; // true
+	}
+	if ((flags & 0x0017) == 0x0010) { // ACK
+
+		tcp_connection_t *conn = find_tcp_connection(eth);
+		if (conn) {
+			if (conn->fin) {
+				dispose_tcp_session(conn);
+				return; // true
 			}
-			memcpy(packet->src_addr, &eth->ip.src, 4);
-			packet->src_port = read_s(&eth->tcp.src_port);
-			packet->dst_port = read_s(&eth->tcp.dst_port);
-			packet->length = len - sizeof(struct udp_frame_t);
-//			memcpy(packet->data, p, packet->length);
-//			ip_stack_globals.udp_packets[ip_stack_globals.udp_packet_count++] = packet;
+			if (memcmp(data, "GET ", 4) == 0) {
+				memset(tmp, 0, sizeof(tmp));
+				struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
+				uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
+
+				prepare_ip_packet(&frame->ip, nullptr);
+				frame->ip.protocol = 6; // TCP
+				write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
+				frame->ip.dst = eth->ip.src;
+				write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x10); // ACK
+				frame->tcp.src_port = eth->tcp.dst_port;
+				frame->tcp.dst_port = eth->tcp.src_port;
+				frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
+				frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
+				write_s(&frame->tcp.window_size_value, 10000);
+				frame->tcp.urgent_pointer = 0;
+
+				static char const *msg = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
+				int len = strlen(msg);
+				memcpy(end, msg, len);
+				end += len;
+
+				send_ip_packet(tmp, end - tmp);
+				return; // true
+			}
+
+		} else {
+			return; // false
 		}
 	}
+	if ((flags & 0x0017) == 0x0011) { // FIN ACK
+		tcp_connection_t *conn = find_tcp_connection(eth);
+		if (conn) {
+			{
+				memset(tmp, 0, sizeof(tmp));
+				struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
+				uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
+
+				prepare_ip_packet(&frame->ip, nullptr);
+				frame->ip.protocol = 6; // TCP
+				write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
+				frame->ip.dst = eth->ip.src;
+				write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x10); // ACK
+				frame->tcp.src_port = eth->tcp.dst_port;
+				frame->tcp.dst_port = eth->tcp.src_port;
+				frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
+				frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
+				write_s(&frame->tcp.window_size_value, 10000);
+				frame->tcp.urgent_pointer = 0;
+
+				send_ip_packet(tmp, end - tmp);
+			}
+			if (!conn->fin) {
+				tcp_send_fin(eth, conn);
+			}
+			return; // true
+		}
+	}
+	return; // false
 }
 
 void on_udp_packet(struct ip_frame_t const *ip, uint8_t *p, bool broadcast)
@@ -1085,7 +1195,9 @@ void eth_on_ip_packet(uint8_t *buf, int len, bool broadcast)
 		p += (ip->version_and_length & 0x0f) * 4;
 		if (ip->protocol == 6) { // TCP
 			struct eth_ip_tcp_frame_t *eth = (struct eth_ip_tcp_frame_t *)buf;
-			on_tcp_packet(eth);
+			uint8_t *data = buf + sizeof(struct eth_ip_tcp_frame_t);
+			int size = len - sizeof(struct eth_ip_tcp_frame_t);
+			on_tcp_packet(eth, data, size);
 			return;
 		}
 		if (ip->protocol == 17) { // UDP
