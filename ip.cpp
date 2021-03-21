@@ -149,6 +149,25 @@ struct tcp_connection_t {
 	bool fin = false;
 };
 
+struct eth_ip_tcp_frame_t {
+	struct ethernet_frame_t eth;
+	struct ip_frame_t ip;
+	struct tcp_frame_t tcp;
+}  __attribute__ ((packed));
+
+struct eth_ip_udp_frame_t {
+	struct ethernet_frame_t eth;
+	struct ip_frame_t ip;
+	struct udp_frame_t udp;
+}  __attribute__ ((packed));
+
+struct tcp_send_packet_t {
+	tcp_send_packet_t *next;
+	int size;
+	struct eth_ip_tcp_frame_t frame;
+	uint8_t data[1];
+}  __attribute__ ((packed));
+
 struct ip_stack_globals_t {
 	uint16_t packet_id;
 	uint8_t mac_addr[6];
@@ -165,6 +184,7 @@ struct ip_stack_globals_t {
 	int dhcp_ack_waiting;
 	int state;
 	std::vector<tcp_connection_t> tcp_connections;
+	struct tcp_send_packet_t *tcp_send_packets = NULL;
 } ip_stack_globals;
 
 
@@ -185,6 +205,7 @@ void ip_stack_init(uint8_t const *macaddr)
 		ip_stack_globals.udp_packets[i] = 0;
 	}
 	ip_stack_globals.udp_packet_count = 0;
+//	tcp_send_packets = NULL;
 	eth_init(ip_stack_globals.mac_addr);
 	sleep_ms(100);
 }
@@ -329,18 +350,6 @@ void set_ip_identifier(struct ip_frame_t *ip)
 	write_s(&ip->identification, ip_stack_globals.ip_identifier);
 	ip_stack_globals.ip_identifier++;
 }
-
-struct eth_ip_tcp_frame_t {
-	struct ethernet_frame_t eth;
-	struct ip_frame_t ip;
-	struct tcp_frame_t tcp;
-}  __attribute__ ((packed));
-
-struct eth_ip_udp_frame_t {
-	struct ethernet_frame_t eth;
-	struct ip_frame_t ip;
-	struct udp_frame_t udp;
-}  __attribute__ ((packed));
 
 void prepare_ip_packet(struct ip_frame_t *ip, void *end)
 {
@@ -993,32 +1002,42 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 	return send_ip_packet(tmp, p - tmp);
 }
 
-void lcd_print_ipv4(uint32_t ipv4);
-
-void tcp_send_fin(struct eth_ip_tcp_frame_t *eth, tcp_connection_t *conn)
+struct tcp_send_packet_t *alloc_tcp_packet(struct eth_ip_tcp_frame_t *eth, int datalen, uint8_t flags)
 {
-	uint8_t tmp[MAX_FRAME_SIZE];
+	tcp_send_packet_t *p = (tcp_send_packet_t *)malloc(sizeof(tcp_send_packet_t) + datalen);
+	memset(p, 0, sizeof(tcp_send_packet_t) + datalen);
+	prepare_ip_packet(&p->frame.ip, nullptr);
+	p->frame.ip.protocol = 6; // TCP
+	write_s(&p->frame.ip.flags_and_fragment_offset, 0x4000);
+	p->frame.ip.dst = eth->ip.src;
+	write_s(&p->frame.tcp.flags, (sizeof(p->frame.tcp) << 10) | flags);
+	p->frame.tcp.src_port = eth->tcp.dst_port;
+	p->frame.tcp.dst_port = eth->tcp.src_port;
+	p->frame.tcp.sequence_number = eth->tcp.acknowledgment_number;
+	p->frame.tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
+	write_s(&p->frame.tcp.window_size_value, 10000);
+	p->frame.tcp.urgent_pointer = 0;
 
-	memset(tmp, 0, sizeof(tmp));
-	struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
-	uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
+	p->size = ((uint8_t *)&p->frame.tcp + sizeof(p->frame.tcp) + datalen) - (uint8_t *)&p->frame;
 
-	prepare_ip_packet(&frame->ip, nullptr);
-	frame->ip.protocol = 6; // TCP
-	write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
-	frame->ip.dst = eth->ip.src;
-	write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x11); // FIN ACK
-	frame->tcp.src_port = eth->tcp.dst_port;
-	frame->tcp.dst_port = eth->tcp.src_port;
-	frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
-	frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
-	write_s(&frame->tcp.window_size_value, 10000);
-	frame->tcp.urgent_pointer = 0;
+	tcp_connection_t conn;
+	conn.port = ntohs(eth->tcp.dst_port);
+	conn.fin = false;
+	ip_stack_globals.tcp_connections.push_back(conn);
 
-	conn->fin = true;
-
-	send_ip_packet(tmp, end - tmp);
+	return p;
 }
+
+void push_tcp_send_packet(tcp_send_packet_t *packet)
+{
+	tcp_send_packet_t **p = &ip_stack_globals.tcp_send_packets;
+	while (*p) {
+		p = &(*p)->next;
+	}
+	*p = packet;
+}
+
+void lcd_print_ipv4(uint32_t ipv4);
 
 tcp_connection_t *find_tcp_connection(eth_ip_tcp_frame_t *eth)
 {
@@ -1029,6 +1048,8 @@ tcp_connection_t *find_tcp_connection(eth_ip_tcp_frame_t *eth)
 	}
 	return nullptr;
 }
+
+void toggle_led();
 
 void dispose_tcp_session(tcp_connection_t *conn)
 {
@@ -1045,9 +1066,6 @@ void dispose_tcp_session(tcp_connection_t *conn)
 
 void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
 {
-	uint8_t tmp[MAX_FRAME_SIZE];
-
-//	struct ip_frame_t const *ip, struct tcp_frame_t const *tcp
 	uint16_t flags = read_s(&eth->tcp.flags);
 	uint8_t len = flags >> 10;
 	uint8_t const *end = (uint8_t const *)&eth->tcp;
@@ -1057,33 +1075,15 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
 		dispose_tcp_session(conn);
 		return; // true
 	}
+
 	if ((flags & 0x0017) == 0x0002) { // SYN
 
 		if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
 			return; // false
 		}
 
-		memset(tmp, 0, sizeof(tmp));
-		struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
-		uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
-
-		prepare_ip_packet(&frame->ip, nullptr);
-		frame->ip.protocol = 6; // TCP
-		write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
-		frame->ip.dst = eth->ip.src;
-		write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x12); // ACK SYN
-		frame->tcp.src_port = eth->tcp.dst_port;
-		frame->tcp.dst_port = eth->tcp.src_port;
-		frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
-		frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
-		write_s(&frame->tcp.window_size_value, 10000);
-		frame->tcp.urgent_pointer = 0;
-
-		tcp_connection_t conn;
-		conn.port = ntohs(eth->tcp.dst_port);
-		ip_stack_globals.tcp_connections.push_back(conn);
-
-		send_ip_packet(tmp, end - tmp);
+		tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x12); // SYN ACK
+		push_tcp_send_packet(p);
 		return; // true
 	}
 	if ((flags & 0x0017) == 0x0010) { // ACK
@@ -1095,28 +1095,13 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
 				return; // true
 			}
 			if (memcmp(data, "GET ", 4) == 0) {
-				memset(tmp, 0, sizeof(tmp));
-				struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
-				uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
-
-				prepare_ip_packet(&frame->ip, nullptr);
-				frame->ip.protocol = 6; // TCP
-				write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
-				frame->ip.dst = eth->ip.src;
-				write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x10); // ACK
-				frame->tcp.src_port = eth->tcp.dst_port;
-				frame->tcp.dst_port = eth->tcp.src_port;
-				frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
-				frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
-				write_s(&frame->tcp.window_size_value, 10000);
-				frame->tcp.urgent_pointer = 0;
-
 				static char const *msg = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
-				int len = strlen(msg);
-				memcpy(end, msg, len);
-				end += len;
+				int datalen = strlen(msg);
 
-				send_ip_packet(tmp, end - tmp);
+				tcp_send_packet_t *p = alloc_tcp_packet(eth, datalen, 0x10); // ACK
+				memcpy(p->data, msg, datalen);
+
+				push_tcp_send_packet(p);
 				return; // true
 			}
 
@@ -1128,26 +1113,13 @@ void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
 		tcp_connection_t *conn = find_tcp_connection(eth);
 		if (conn) {
 			{
-				memset(tmp, 0, sizeof(tmp));
-				struct eth_ip_tcp_frame_t *frame = (struct eth_ip_tcp_frame_t *)tmp;
-				uint8_t *end = (uint8_t *)&frame->tcp + sizeof(frame->tcp);
-
-				prepare_ip_packet(&frame->ip, nullptr);
-				frame->ip.protocol = 6; // TCP
-				write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
-				frame->ip.dst = eth->ip.src;
-				write_s(&frame->tcp.flags, ((end - (uint8_t *)&frame->tcp) << 10) | 0x10); // ACK
-				frame->tcp.src_port = eth->tcp.dst_port;
-				frame->tcp.dst_port = eth->tcp.src_port;
-				frame->tcp.sequence_number = eth->tcp.acknowledgment_number;
-				frame->tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
-				write_s(&frame->tcp.window_size_value, 10000);
-				frame->tcp.urgent_pointer = 0;
-
-				send_ip_packet(tmp, end - tmp);
+				tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x10); // ACK
+				push_tcp_send_packet(p);
 			}
 			if (!conn->fin) {
-				tcp_send_fin(eth, conn);
+				tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x11); // FIN ACK
+				push_tcp_send_packet(p);
+				conn->fin = true;
 			}
 			return; // true
 		}
@@ -1282,6 +1254,12 @@ void ip_stack_process()
 			eth_on_arp_packet(tmp, len, broadcast);
 			continue;
 		}
+	}
+	tcp_send_packet_t *p = ip_stack_globals.tcp_send_packets;
+	if (p) {
+		ip_stack_globals.tcp_send_packets = p->next;
+		send_ip_packet((uint8_t *)&p->frame, p->size);
+		free(p);
 	}
 }
 
