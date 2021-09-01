@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <array>
+#include <algorithm>
 
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
@@ -17,6 +19,8 @@ extern "C" {
 
 #define TIMEZONE (9 * 60 * 60)
 #define NTP_SERVER "ntp.nict.jp"
+
+#define INPUT_PIN 26
 
 #define LED_PIN 25
 void toggle_led()
@@ -159,6 +163,61 @@ extern "C" int main()
 	lcd_clear();
 	lcd_set_cursor(0, 0);
 
+	if (0) {
+//		uint64_t t;
+//		char tmp[100];
+
+//		t = time_us_64();
+
+//		sleep_ms(1000);
+
+//		t = time_us_64() - t;
+//		sprintf(tmp, "%ld", t);
+//		lcd_print(tmp);
+		std::array<uint64_t, 100> times;
+		gpio_init(INPUT_PIN);
+		gpio_set_dir(INPUT_PIN, GPIO_IN);
+		bool state = false;
+		uint64_t time = time_us_64();
+		uint64_t sec = time / 1000000;
+		int n = 0;
+		while (1) {
+			bool f = gpio_get(INPUT_PIN);
+			gpio_put(LED_PIN, f);
+			if (state != f) {
+				if (!f) {
+					uint64_t t = time_us_64();
+					n++;
+					if (n == 10) {
+						n = 0;
+						std::rotate(times.begin(), times.begin() + 1, times.end());
+						times.back() = t - time;
+						time = t;
+						auto s = t / 1000000;
+						if (sec != s) {
+							sec = s;
+							auto arr = times;
+							std::sort(arr.begin(), arr.end());
+							float e = 0;
+							for (int i = 30; i < 70; i++) {
+								e += arr[i];
+							}
+							e /= 40;
+							e = 10000000 / e;
+							char tmp[100];
+							sprintf(tmp, "%2.3fHz", e);
+							lcd_clear();
+							lcd_print(tmp);
+						}
+					}
+				}
+				state = f;
+			}
+		}
+		return 0;
+	}
+
+
 	static const uint8_t macaddr[] = {
 		0xfe, 0xff, 0xff, 0x00, 0x00, 0xf0
 	};
@@ -169,7 +228,7 @@ extern "C" int main()
 
 	ip_stack_init(macaddr);
 
-#if 1
+#if 0
 	{
 		uint8_t ip_address[] = {
 			10, 10, 10, 100
@@ -243,7 +302,7 @@ extern "C" int main()
 				display_date_time(&r);
 
 				if (r.minute % 30 == 29 && r.second == 30) {
-					adjust_time = true;
+//					adjust_time = true;
 				}
 			}
 		}

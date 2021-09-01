@@ -1,7 +1,7 @@
 
 NAME=ntpclock
 PICO_SDK_PATH=~/pico/pico-sdk
-PICO=pci-0000:00:14.0-usb-0:3:1.0-scsi-0:0:0:0-part1
+PICO=pci-0000:00:14.0-usb-0:4:1.0-scsi-0:0:0:0-part1
 
 all:
 	-mkdir build

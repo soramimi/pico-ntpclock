@@ -129,7 +129,7 @@ enum {
 
 #define ARP_CACHE_SIZE 10
 #define DNS_CACHE_SIZE 10
-#define UDP_PACKET_BUFFER_SIZE 8
+#define UDP_PACKET_BUFFER_SIZE 64
 
 struct arp_cache_item_t {
 	bool valid;
