@@ -153,7 +153,7 @@ int enc28j60_peek_packet()
 	stat |= enc28j60_io(0) << 8;
 	enc28j60_cs(1);
 
-	if (len < 6 + 6 + 2 + 4) {
+	if (len < 4) {//if (len < 6 + 6 + 2 + 4) {
 		len = -1;
 	} else {
 		len -= 4;
