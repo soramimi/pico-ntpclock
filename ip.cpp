@@ -148,6 +148,8 @@ struct tcp_peer_t {
 	uint8_t mac[6];
 };
 
+static constexpr unsigned HTTP_RESPONSE_CAPACITY = 192;
+
 struct tcp_connection_t {
 	tcp_peer_t peer;
 	uint32_t receive_next;
@@ -155,7 +157,6 @@ struct tcp_connection_t {
 	uint32_t send_unacknowledged;
 	uint32_t last_activity;
 	uint32_t last_send;
-	char const *response;
 	uint16_t response_length;
 	tcp_state_t state;
 	uint8_t retries;
@@ -164,6 +165,8 @@ struct tcp_connection_t {
 	bool peer_fin;
 	bool request_line_complete;
 	char request_line[64];
+	// Keep the response for retransmission, even if the application data changes.
+	char response[HTTP_RESPONSE_CAPACITY];
 };
 
 struct eth_ip_tcp_frame_t {
@@ -992,12 +995,6 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 }
 
 static constexpr uint16_t HTTP_PORT = 80;
-static constexpr char HTTP_OK[] = "HTTP/1.1 200 OK\r\n"
-	"Content-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nConnection: close\r\n\r\n"
-	"Hello, world!\n";
-static constexpr char HTTP_NOT_FOUND[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-static constexpr unsigned HTTP_MAX_RESPONSE_SIZE =
-	(sizeof(HTTP_OK) > sizeof(HTTP_NOT_FOUND) ? sizeof(HTTP_OK) : sizeof(HTTP_NOT_FOUND)) - 1;
 static constexpr uint32_t TCP_RETRY_MS = 1000;
 static constexpr uint32_t TCP_IDLE_MS = 30000;
 static constexpr uint32_t TCP_TIME_WAIT_MS = 120000;
@@ -1018,7 +1015,7 @@ static bool tcp_sequence_before(uint32_t a, uint32_t b)
 static void send_tcp_segment(tcp_peer_t const &peer, uint32_t sequence, uint32_t acknowledgment,
 		uint16_t flags, char const *payload = nullptr, unsigned payload_length = 0)
 {
-	uint8_t bytes[sizeof(eth_ip_tcp_frame_t) + HTTP_MAX_RESPONSE_SIZE] = {};
+	uint8_t bytes[sizeof(eth_ip_tcp_frame_t) + HTTP_RESPONSE_CAPACITY] = {};
 	auto *frame = (struct eth_ip_tcp_frame_t *)bytes;
 	memcpy(frame->eth.dst, peer.mac, 6);
 	memcpy(frame->eth.src, ip_stack_globals.mac_addr, 6);
@@ -1103,32 +1100,7 @@ static void accept_tcp_connection(tcp_peer_t const &peer, uint32_t sequence, uin
 	send_pending_tcp_segment(*slot, now);
 }
 
-static void select_http_response(tcp_connection_t &connection)
-{
-	connection.response = HTTP_NOT_FOUND;
-	connection.response_length = sizeof(HTTP_NOT_FOUND) - 1;
-	char const *method_end = strchr(connection.request_line, ' ');
-	if (!method_end) {
-		return;
-	}
-
-	char const *path = method_end + 1;
-	size_t path_length = strcspn(path, " ?");
-	static constexpr char index_path[] = "/index.html";
-	bool root = path_length == 1 && path[0] == '/';
-	bool index = path_length == sizeof(index_path) - 1 && memcmp(path, index_path, path_length) == 0;
-	if (path[path_length] == '\0' || !(root || index)) {
-		return;
-	}
-
-	connection.response = HTTP_OK;
-	connection.response_length = sizeof(HTTP_OK) - 1;
-	if (method_end - connection.request_line == 4 && memcmp(connection.request_line, "HEAD", 4) == 0) {
-		connection.response_length = strstr(HTTP_OK, "\r\n\r\n") - HTTP_OK + 4;
-	}
-}
-
-static void receive_http_headers(tcp_connection_t &connection, uint8_t const *data, unsigned length)
+static bool receive_http_headers(tcp_connection_t &connection, uint8_t const *data, unsigned length)
 {
 	static constexpr char end_of_headers[] = "\r\n\r\n";
 	for (unsigned i = 0; i < length; i++) {
@@ -1142,13 +1114,13 @@ static void receive_http_headers(tcp_connection_t &connection, uint8_t const *da
 		}
 		if (byte == end_of_headers[connection.header_end]) {
 			if (++connection.header_end == sizeof(end_of_headers) - 1) {
-				select_http_response(connection);
-				return;
+				return true;
 			}
 		} else {
 			connection.header_end = byte == '\r' ? 1 : 0;
 		}
 	}
+	return false;
 }
 
 static void on_tcp_packet(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip,
@@ -1243,15 +1215,22 @@ static void on_tcp_packet(struct ethernet_frame_t const *eth, struct ip_frame_t 
 	data += overlap;
 	data_length -= overlap;
 	bool acknowledge_data = data_length != 0 || fin;
+	bool request_complete = false;
 	if (!connection->peer_fin) {
 		connection->receive_next += data_length + fin;
 		connection->peer_fin = fin;
 		if (connection->state == TCP_ESTABLISHED) {
-			receive_http_headers(*connection, data, data_length);
+			request_complete = receive_http_headers(*connection, data, data_length);
 		}
 	}
 
-	if (connection->state == TCP_ESTABLISHED && (connection->response || connection->peer_fin)) {
+	if (connection->state == TCP_ESTABLISHED && (request_complete || connection->peer_fin)) {
+		if (request_complete) {
+			unsigned length = handle_http_request(connection->request_line, connection->response, sizeof(connection->response));
+			if (length <= sizeof(connection->response)) {
+				connection->response_length = length;
+			}
+		}
 		connection->state = TCP_FIN_SENT;
 		connection->send_next += connection->response_length + 1;
 		send_pending_tcp_segment(*connection, now);

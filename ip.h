@@ -18,6 +18,8 @@ uint32_t milliseconds();
 void eth_init(uint8_t const *macaddr);
 unsigned int eth_recv_packet(void *ptr, int maxlen);
 void eth_send_packet(void const *ptr, unsigned int len);
+// Write the HTTP response for a request line and return its byte length, or 0 on failure.
+unsigned int handle_http_request(char const *request_line, char *response, unsigned int capacity);
 
 //
 

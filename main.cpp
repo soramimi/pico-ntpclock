@@ -108,6 +108,19 @@ struct Result {
 	int weekday;
 };
 
+static Result local_date_time(uint32_t seconds)
+{
+	uint64_t t = (uint64_t)seconds + TIMEZONE;
+	unsigned long cjd = t / (24 * 60 * 60) + 2415021;
+	Result r;
+	r.hour = t / 3600 % 24;
+	r.minute = t / 60 % 60;
+	r.second = t % 60;
+	r.weekday = (cjd + 1) % 7;
+	convert_cjd_to_ymd(cjd, &r.year, &r.month, &r.day);
+	return r;
+}
+
 void display_date_time(struct Result const *r)
 {
 	lcd_set_cursor(0, 0);
@@ -130,13 +143,15 @@ void display_date_time(struct Result const *r)
 
 //
 
-uint64_t milliseconds_diff = 0;
+static uint64_t milliseconds_diff = 0;
+static bool valid_time = false;
 
 void set_time(uint32_t s, uint16_t ms)
 {
 	uint64_t m = (uint64_t)s * 1000 + ms;
 	uint64_t t = to_us_since_boot(get_absolute_time()) / 1000;
 	milliseconds_diff = m - t;
+	valid_time = true;
 }
 
 uint32_t get_time()
@@ -145,12 +160,47 @@ uint32_t get_time()
 	return m / 1000;
 }
 
+extern "C" unsigned int handle_http_request(char const *request_line, char *response, unsigned int capacity)
+{
+	char const *method_end = strchr(request_line, ' ');
+	bool head = method_end && method_end - request_line == 4 && memcmp(request_line, "HEAD", 4) == 0;
+	bool clock_path = false;
+	if (method_end) {
+		char const *path = method_end + 1;
+		size_t path_length = strcspn(path, " ?");
+		static constexpr char index_path[] = "/index.html";
+		bool root = path_length == 1 && path[0] == '/';
+		bool index = path_length == sizeof(index_path) - 1 && memcmp(path, index_path, path_length) == 0;
+		clock_path = path[path_length] != '\0' && (root || index);
+	}
+
+	char const *status = "404 Not Found";
+	char const *body = "";
+	char time_text[32];
+	if (clock_path) {
+		if (valid_time) {
+			Result r = local_date_time(get_time());
+			snprintf(time_text, sizeof(time_text), "%04d-%02d-%02d %02d:%02d:%02d JST\n",
+				r.year, r.month, r.day, r.hour, r.minute, r.second);
+			status = "200 OK";
+			body = time_text;
+		} else {
+			status = "503 Service Unavailable";
+			body = "Time not synchronized\n";
+		}
+	}
+
+	char const *headers = clock_path ? "Content-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\n" : "";
+	int length = snprintf(response, capacity, "HTTP/1.1 %s\r\nContent-Length: %u\r\n%sConnection: close\r\n\r\n%s",
+		status, (unsigned)strlen(body), headers, head ? "" : body);
+	return length >= 0 && (unsigned)length < capacity ? (unsigned)length : 0;
+}
+
 //
 
 extern "C" int main()
 {
 	uint32_t now = 0;
-	bool valid_time = false;
 	bool adjust_time = false;
 
 	gpio_init(LED_PIN);
@@ -281,23 +331,15 @@ extern "C" int main()
 			uint16_t ms;
 			if (parse_ntp_packet(packet, &s, &ms)) {
 				set_time(s, ms);
-				valid_time = true;
 			}
 			free(packet);
 		}
 
 		if (valid_time) {
-			unsigned long t = get_time();
+			uint32_t t = get_time();
 			if (now < t) {
 				now = t;
-				t += TIMEZONE;
-				unsigned long cjd = t / (24 * 60 * 60) + 2415021;
-				struct Result r;
-				r.hour = t / 3600 % 24;
-				r.minute = t / 60 % 60;
-				r.second = t % 60;
-				r.weekday = (cjd + 1) % 7;
-				convert_cjd_to_ymd(cjd, &r.year, &r.month, &r.day);
+				Result r = local_date_time(t);
 
 				display_date_time(&r);
 
