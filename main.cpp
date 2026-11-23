@@ -5,14 +5,22 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <array>
+#include <algorithm>
+
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 
+extern "C" {
 #include "lcd.h"
 #include "ip.h"
+}
 
 #define TIMEZONE (9 * 60 * 60)
 #define NTP_SERVER "ntp.nict.jp"
+
+#define INPUT_PIN 26
 
 #define LED_PIN 25
 void toggle_led()
@@ -47,7 +55,7 @@ void send_ntp_request(uint8_t const *ntp_server_addr)
 	send_udp_packet(ntp_server_addr, 123, 1024, data, sizeof(data));
 }
 
-bool parse_ntp_packet(struct packet_header_t *packet, unsigned long *p_s, int *p_ms)
+bool parse_ntp_packet(struct packet_header_t *packet, uint32_t *p_s, uint16_t *p_ms)
 {
 	if (!packet) {
 		return false;
@@ -139,7 +147,7 @@ uint32_t get_time()
 
 //
 
-int main()
+extern "C" int main()
 {
 	uint32_t now = 0;
 	bool valid_time = false;
@@ -155,6 +163,61 @@ int main()
 	lcd_clear();
 	lcd_set_cursor(0, 0);
 
+	if (0) {
+//		uint64_t t;
+//		char tmp[100];
+
+//		t = time_us_64();
+
+//		sleep_ms(1000);
+
+//		t = time_us_64() - t;
+//		sprintf(tmp, "%ld", t);
+//		lcd_print(tmp);
+		std::array<uint64_t, 100> times;
+		gpio_init(INPUT_PIN);
+		gpio_set_dir(INPUT_PIN, GPIO_IN);
+		bool state = false;
+		uint64_t time = time_us_64();
+		uint64_t sec = time / 1000000;
+		int n = 0;
+		while (1) {
+			bool f = gpio_get(INPUT_PIN);
+			gpio_put(LED_PIN, f);
+			if (state != f) {
+				if (!f) {
+					uint64_t t = time_us_64();
+					n++;
+					if (n == 10) {
+						n = 0;
+						std::rotate(times.begin(), times.begin() + 1, times.end());
+						times.back() = t - time;
+						time = t;
+						auto s = t / 1000000;
+						if (sec != s) {
+							sec = s;
+							auto arr = times;
+							std::sort(arr.begin(), arr.end());
+							float e = 0;
+							for (int i = 30; i < 70; i++) {
+								e += arr[i];
+							}
+							e /= 40;
+							e = 10000000 / e;
+							char tmp[100];
+							sprintf(tmp, "%2.3fHz", e);
+							lcd_clear();
+							lcd_print(tmp);
+						}
+					}
+				}
+				state = f;
+			}
+		}
+		return 0;
+	}
+
+
 	static const uint8_t macaddr[] = {
 		0xfe, 0xff, 0xff, 0x00, 0x00, 0xf0
 	};
@@ -168,16 +231,16 @@ int main()
 #if 0
 	{
 		uint8_t ip_address[] = {
-			192, 168, 0, 100
+			10, 10, 10, 100
 		};
 		uint8_t subnet_mask[] = {
 			255, 255, 255, 0
 		};
 		uint8_t gateway_addr[] = {
-			192, 168, 0, 1
+			10, 10, 10, 1
 		};
 		uint8_t dns_server[] = {
-			192, 168, 0, 1
+			10, 10, 10, 1
 		};
 		ip_config(ip_address, subnet_mask, gateway_addr, dns_server);
 	}
@@ -189,6 +252,15 @@ int main()
 
 	if (!gethostbyname(NTP_SERVER, ntp_server_addr)) {
 		giveup("Resolve error");
+	}
+
+	{
+		uint8_t ipv4[4];
+		ip_get_address(ipv4);
+		char tmp[100];
+		sprintf(tmp, "%d.%d.%d.%d", ipv4[0], ipv4[1], ipv4[2], ipv4[3]);
+		lcd_set_cursor(1, 0);
+		lcd_print(tmp);
 	}
 
 	//
@@ -230,7 +302,7 @@ int main()
 				display_date_time(&r);
 
 				if (r.minute % 30 == 29 && r.second == 30) {
-					adjust_time = true;
+//					adjust_time = true;
 				}
 			}
 		}

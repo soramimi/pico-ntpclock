@@ -3,9 +3,10 @@
  * MIT License
  */
 
-#include "enc28j60.h"
-#include "ip.h"
 #include "pico/stdlib.h"
+#include "enc28j60.h"
+#include "enc28j60io.h"
+#include "ip.h"
 
 uint16_t _enc28j60_next_packet_ptr;
 
@@ -152,7 +153,7 @@ int enc28j60_peek_packet()
 	stat |= enc28j60_io(0) << 8;
 	enc28j60_cs(1);
 
-	if (len < 6 + 6 + 2 + 4) {
+	if (len < 4) {//if (len < 6 + 6 + 2 + 4) {
 		len = -1;
 	} else {
 		len -= 4;

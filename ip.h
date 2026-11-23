@@ -9,6 +9,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // provided by host program
 uint32_t milliseconds();
 void eth_init(uint8_t const *macaddr);
@@ -28,10 +32,15 @@ struct packet_header_t {
 void ip_config(uint8_t const *ipv4, uint8_t const *mask, uint8_t const *gateway, uint8_t const *dns);
 void ip_stack_init(uint8_t const *macaddr);
 bool ip_config_with_dhcp();
+void ip_get_address(uint8_t *ipv4);
 void ip_stack_process();
 bool gethostbyname(char const *name, uint8_t *ipv4);
 bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport, uint8_t const *ptr, uint16_t len);
 struct packet_header_t *take_udp_packet(); // after using the buffer should be free(p);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

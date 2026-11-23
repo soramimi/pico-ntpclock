@@ -21,12 +21,13 @@ HEADERS += build/generated/pico_base/pico/config_autogen.h \
            ip.h \
            lcd.h
 
-SOURCES += main.c \
+SOURCES += \
            build/CMakeFiles/3.16.3/CompilerIdC/CMakeCCompilerId.c \
            build/CMakeFiles/3.16.3/CompilerIdCXX/CMakeCXXCompilerId.cpp \
            build/elf2uf2/CMakeFiles/3.16.3/CompilerIdC/CMakeCCompilerId.c \
            build/elf2uf2/CMakeFiles/3.16.3/CompilerIdCXX/CMakeCXXCompilerId.cpp \
            enc28j60.c \
            enc28j60io.c \
-           ip.c \
-           lcd.c
+           ip.cpp \
+           lcd.c \
+           main.cpp
