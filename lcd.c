@@ -43,6 +43,7 @@ const int LCD_ENABLE_BIT = 0x04;
 
 // By default these LCD display drivers are on bus address 0x27
 static int addr = 0x27;
+static bool ready;
 
 // Modes for lcd_send_byte
 #define LCD_CHARACTER  1
@@ -52,39 +53,53 @@ static int addr = 0x27;
 #define MAX_CHARS      16
 
 /* Quick helper function for single byte transfers */
-void i2c_write_byte(uint8_t val)
+static bool i2c_write_byte(uint8_t val)
 {
-	i2c_write_blocking(I2C_PORT, addr, &val, 1, false);
+	if (ready) {
+		ready = i2c_write_timeout_us(I2C_PORT, addr, &val, 1, false, 2000) == 1;
+	}
+	return ready;
 }
 
-void lcd_toggle_enable(uint8_t val)
+static bool lcd_toggle_enable(uint8_t val)
 {
 	// Toggle enable pin on LCD display
 	// We cannot do this too quickly or things don't work
 #define DELAY_US 600
 	sleep_us(DELAY_US);
-	i2c_write_byte(val | LCD_ENABLE_BIT);
+	if (!i2c_write_byte(val | LCD_ENABLE_BIT)) {
+		return false;
+	}
 	sleep_us(DELAY_US);
-	i2c_write_byte(val & ~LCD_ENABLE_BIT);
+	if (!i2c_write_byte(val & ~LCD_ENABLE_BIT)) {
+		return false;
+	}
 	sleep_us(DELAY_US);
+	return true;
+}
+
+static bool lcd_send_nibble(uint8_t value)
+{
+	return i2c_write_byte(value) && lcd_toggle_enable(value);
 }
 
 // The display is sent a byte as two separate nibble transfers
-void lcd_send_byte(uint8_t val, int mode)
+static void lcd_send_byte(uint8_t val, int mode)
 {
 	uint8_t high = mode | (val & 0xF0) | LCD_BACKLIGHT;
 	uint8_t low = mode | ((val << 4) & 0xF0) | LCD_BACKLIGHT;
 
-	i2c_write_byte(high);
-	lcd_toggle_enable(high);
-	i2c_write_byte(low);
-	lcd_toggle_enable(low);
+	if (lcd_send_nibble(high)) {
+		lcd_send_nibble(low);
+	}
 }
 
 void lcd_clear()
 {
 	lcd_send_byte(LCD_CLEARDISPLAY, LCD_COMMAND);
-	sleep_us(500);
+	if (ready) {
+		sleep_us(500);
+	}
 }
 
 // go to location on LCD
@@ -101,7 +116,7 @@ void lcd_char(char val)
 
 void lcd_print(const char *s)
 {
-	while (*s) {
+	while (ready && *s) {
 		lcd_char(*s++);
 	}
 }
@@ -114,16 +129,32 @@ void lcd_init()
 	gpio_pull_up(I2C_SDA);
 	gpio_pull_up(I2C_SCL);
 	bi_decl(bi_2pins_with_func(I2C_SDA, I2C_SCL, GPIO_FUNC_I2C));
+	ready = true;
 
-	lcd_send_byte(0x03, LCD_COMMAND);
-	lcd_send_byte(0x03, LCD_COMMAND);
-	lcd_send_byte(0x03, LCD_COMMAND);
-	lcd_send_byte(0x02, LCD_COMMAND);
+	if (!i2c_write_byte(LCD_BACKLIGHT)) {
+		return;
+	}
+	// Single-nibble writes recover the 4-bit interface after an interrupted write.
+	sleep_ms(41);
+	if (!lcd_send_nibble(0x30 | LCD_BACKLIGHT)) {
+		return;
+	}
+	sleep_ms(5);
+	if (!lcd_send_nibble(0x30 | LCD_BACKLIGHT) || !lcd_send_nibble(0x30 | LCD_BACKLIGHT) ||
+			!lcd_send_nibble(0x20 | LCD_BACKLIGHT)) {
+		return;
+	}
 
-	lcd_send_byte(LCD_ENTRYMODESET | LCD_ENTRYLEFT, LCD_COMMAND);
 	lcd_send_byte(LCD_FUNCTIONSET | LCD_2LINE, LCD_COMMAND);
-	lcd_send_byte(LCD_DISPLAYCONTROL | LCD_DISPLAYON, LCD_COMMAND);
+	lcd_send_byte(LCD_DISPLAYCONTROL, LCD_COMMAND);
 	lcd_clear();
+	lcd_send_byte(LCD_ENTRYMODESET | LCD_ENTRYLEFT, LCD_COMMAND);
+	lcd_send_byte(LCD_DISPLAYCONTROL | LCD_DISPLAYON, LCD_COMMAND);
+}
+
+bool lcd_ready(void)
+{
+	return ready;
 }
 
 void lcd_print_number(unsigned int v, int n)
@@ -132,7 +163,7 @@ void lcd_print_number(unsigned int v, int n)
 	char tmp[20];
 	char *p = tmp + sizeof(tmp);
 	*--p = 0;
-	for (i = 0; i < n; i++) {
+	for (i = 0; i < n && p > tmp; i++) {
 		*--p = v % 10 + '0';
 		v /= 10;
 	}

@@ -8,12 +8,6 @@
 
 #include <stdint.h>
 
-void enc28j60_init(uint8_t const *macaddr);
-int enc28j60_peek_packet();
-void enc28j60_drop_packet();
-void enc28j60_recv_packet(uint8_t *ptr, int maxlen);
-void enc28j60_send_packet(uint8_t const *ptr, int len);
-
 #define MAX_FRAME_SIZE 1518
 
 #define RXST_INIT 0x0000
@@ -44,8 +38,8 @@ void enc28j60_send_packet(uint8_t const *ptr, int len);
 #define EDMADSTH 0x15
 #define EDMACSL 0x16
 #define EDMACSH 0x17
-//#define - 0x18
-//#define - 0x19
+// #define - 0x18
+// #define - 0x19
 
 // bank 1
 #define EHT0 0x00
@@ -66,38 +60,38 @@ void enc28j60_send_packet(uint8_t const *ptr, int len);
 #define EPMM7 0x0f
 #define EPMCSL 0x10
 #define EPMCSH 0x11
-//#define - 0x12
-//#define - 0x13
+// #define - 0x12
+// #define - 0x13
 #define EPMOL 0x14
 #define EPMOH 0x15
-//#define Reserved 0x16
-//#define Reserved 0x17
+// #define Reserved 0x16
+// #define Reserved 0x17
 #define ERXFCON 0x18
 #define EPKTCNT 0x19
 
 // bank 2
 #define MACON1 0x00
-//#define Reserved 0x01
+// #define Reserved 0x01
 #define MACON3 0x02
 #define MACON4 0x03
 #define MABBIPG 0x04
-//#define - 0x05
+// #define - 0x05
 #define MAIPGL 0x06
 #define MAIPGH 0x07
 #define MACLCON1 0x08
 #define MACLCON2 0x09
 #define MAMXFLL 0x0a
 #define MAMXFLH 0x0b
-//#define Reserved 0x0c
-//#define Reserved 0x0d
-//#define Reserved 0x0e
-//#define - 0x0f
-//#define Reserved 0x10
-//#define Reserved 0x11
+// #define Reserved 0x0c
+// #define Reserved 0x0d
+// #define Reserved 0x0e
+// #define - 0x0f
+// #define Reserved 0x10
+// #define Reserved 0x11
 #define MICMD 0x12
-//#define - 0x13
+// #define - 0x13
 #define MIREGADR 0x14
-//#define Reserved 0x15
+// #define Reserved 0x15
 #define MIWRL 0x16
 #define MIWRH 0x17
 #define MIRDL 0x18
@@ -115,24 +109,24 @@ void enc28j60_send_packet(uint8_t const *ptr, int len);
 #define EBSTCSL 0x08
 #define EBSTCSH 0x09
 #define MISTAT 0x0a
-//#define - 0x0b
-//#define - 0x0c
-//#define - 0x0d
-//#define - 0x0e
-//#define - 0x0f
-//#define - 0x10
-//#define - 0x11
+// #define - 0x0b
+// #define - 0x0c
+// #define - 0x0d
+// #define - 0x0e
+// #define - 0x0f
+// #define - 0x10
+// #define - 0x11
 #define EREVID 0x12
-//#define - 0x13
-//#define - 0x14
+// #define - 0x13
+// #define - 0x14
 #define ECOCON 0x15
-//#define Reserved 0x16
+// #define Reserved 0x16
 #define EFLOCON 0x17
 #define EPAUSL 0x18
 #define EPAUSH 0x19
 
 // common
-//#define Reserved 0x1a
+// #define Reserved 0x1a
 #define EIE 0x1b
 #define EIR 0x1c
 #define ESTAT 0x1d
@@ -151,4 +145,3 @@ void enc28j60_send_packet(uint8_t const *ptr, int len);
 #define PHLCON 0x14
 
 #endif
-

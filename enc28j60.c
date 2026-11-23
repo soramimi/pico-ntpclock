@@ -9,40 +9,39 @@
 #include "ip.h"
 
 #define RXND_INIT (TXST_INIT - 1)
+#define ETHERNET_HEADER_SIZE 14
+#define ETHERNET_FCS_SIZE 4
+#define CONTROLLER_TIMEOUT_US 5000
 
-uint16_t _enc28j60_next_packet_ptr;
+enum {
+	ECON1_TXRST = 0x80,
+	ECON1_TXRTS = 0x08,
+	ECON1_RXEN = 0x04,
+	ECON2_PKTDEC = 0x40,
+	EIR_TXIF = 0x08,
+	EIR_TXERIF = 0x02,
+	ESTAT_TXABRT = 0x02,
+	ESTAT_CLKRDY = 0x01,
+	MISTAT_BUSY = 0x01,
+	PHSTAT2_LSTAT = 0x0400,
+	RX_STATUS_OK = 0x80,
+};
 
-int enc28j60_read_control_e(int reg)
+static uint16_t next_packet;
+
+static uint8_t read_control(int reg, bool mac_or_mii)
 {
-	int t;
 	enc28j60_cs(0);
 	enc28j60_io(reg);
-	t = enc28j60_io(0);
+	if (mac_or_mii) {
+		enc28j60_io(0);
+	}
+	uint8_t data = enc28j60_io(0);
 	enc28j60_cs(1);
-	return t;
+	return data;
 }
 
-int enc28j60_read_control_m(int reg)
-{
-	int t;
-	enc28j60_cs(0);
-	enc28j60_io(reg);
-	enc28j60_io(reg); // 1 more
-	t = enc28j60_io(0);
-	enc28j60_cs(1);
-	return t;
-}
-
-int enc28j60_read_buffer()
-{
-	int t;
-	enc28j60_cs(0);
-	enc28j60_io(0x3a);
-	t = enc28j60_io(0);
-	enc28j60_cs(1);
-}
-
-void enc28j60_write_control(int reg, int val)
+static void write_control(int reg, int val)
 {
 	enc28j60_cs(0);
 	enc28j60_io(0x40 | reg);
@@ -50,15 +49,13 @@ void enc28j60_write_control(int reg, int val)
 	enc28j60_cs(1);
 }
 
-int enc28j60_write_buffer(int val)
+static void write_control16(int low_reg, uint16_t value)
 {
-	enc28j60_cs(0);
-	enc28j60_io(0x7a);
-	enc28j60_io(val);
-	enc28j60_cs(1);
+	write_control(low_reg, value & 0xff);
+	write_control(low_reg + 1, value >> 8);
 }
 
-int enc28j60_bit_set(int reg, int val)
+static void bit_set(int reg, int val)
 {
 	enc28j60_cs(0);
 	enc28j60_io(0x80 | reg);
@@ -66,7 +63,7 @@ int enc28j60_bit_set(int reg, int val)
 	enc28j60_cs(1);
 }
 
-int enc28j60_bit_clr(int reg, int val)
+static void bit_clear(int reg, int val)
 {
 	enc28j60_cs(0);
 	enc28j60_io(0xa0 | reg);
@@ -74,234 +71,210 @@ int enc28j60_bit_clr(int reg, int val)
 	enc28j60_cs(1);
 }
 
-int enc28j60_reset()
+static void select_bank(int bank)
+{
+	bit_clear(ECON1, 0x03);
+	bit_set(ECON1, bank & 0x03);
+}
+
+static void reset(void)
 {
 	enc28j60_cs(0);
 	enc28j60_io(0xff);
 	enc28j60_cs(1);
 }
 
-void enc28j60_select_bank(int n)
+static bool wait_for_phy(void)
 {
-	enc28j60_bit_clr(ECON1, 0x03);
-	enc28j60_bit_set(ECON1, n & 0x03);
+	select_bank(3);
+	uint64_t deadline = time_us_64() + CONTROLLER_TIMEOUT_US;
+	do {
+		if (!(read_control(MISTAT, true) & MISTAT_BUSY)) {
+			return true;
+		}
+	} while (time_us_64() < deadline);
+	return false;
 }
 
-void enc28j60_write_phy(int reg, int val)
+static bool write_phy(int reg, uint16_t value)
 {
-	enc28j60_select_bank(2);
-	enc28j60_write_control(MIREGADR, reg);
-	enc28j60_write_control(MIWRL, val & 0xff);
-	enc28j60_write_control(MIWRH, val >> 8);
-	enc28j60_select_bank(3);
-	while (enc28j60_read_control_m(MISTAT) & 0x01);
+	select_bank(2);
+	write_control(MIREGADR, reg);
+	write_control16(MIWRL, value);
+	return wait_for_phy();
 }
 
-void enc28j60_send_packet(uint8_t const *ptr, int len)
+static bool read_phy(int reg, uint16_t *value)
 {
-	int i;
-
-	if (len < 0 || len > MAX_FRAME_SIZE) {
-		return;
+	select_bank(2);
+	write_control(MIREGADR, reg);
+	write_control(MICMD, 1);
+	sleep_us(11);
+	bool ready = wait_for_phy();
+	select_bank(2);
+	write_control(MICMD, 0);
+	if (!ready) {
+		return false;
 	}
-
-	enc28j60_select_bank(0);
-
-	while (enc28j60_read_control_e(ECON1) & 0x08); // while ECON1.TXRTS == 1
-
-	enc28j60_write_control(ETXSTL, TXST_INIT & 0xff);
-	enc28j60_write_control(ETXSTH, TXST_INIT >> 8);
-
-	enc28j60_write_control(EWRPTL, TXST_INIT & 0xff);
-	enc28j60_write_control(EWRPTH, TXST_INIT >> 8);
-
-	enc28j60_write_control(ETXNDL, (TXST_INIT + len) & 0xff);
-	enc28j60_write_control(ETXNDH, (TXST_INIT + len) >> 8);
-
-	enc28j60_cs(0);
-	enc28j60_io(0x7a);
-	enc28j60_io(0x00);
-	for (i = 0; i < len; i++) {
-		enc28j60_io(ptr[i]);
-	}
-	enc28j60_cs(1);
-
-	enc28j60_bit_clr(EIR, 0x08);
-	enc28j60_bit_set(EIE, 0x08);
-	enc28j60_bit_set(ECON1, 0x08);
+	uint16_t low = read_control(MIRDL, true);
+	*value = low | ((uint16_t)read_control(MIRDH, true) << 8);
+	return true;
 }
 
-int enc28j60_peek_packet()
+static bool controller_ready(void)
 {
-	uint16_t next;
-	uint16_t len;
-	uint16_t stat;
-
-	enc28j60_select_bank(1);
-	if (enc28j60_read_control_e(EPKTCNT) == 0) {
-		return 0;
-	}
-
-	enc28j60_select_bank(0);
-	enc28j60_write_control(ERDPTL, _enc28j60_next_packet_ptr & 0xff);
-	enc28j60_write_control(ERDPTH, _enc28j60_next_packet_ptr >> 8);
-
-	enc28j60_cs(0);
-	enc28j60_io(0x3a);
-	next = enc28j60_io(0);
-	next |= enc28j60_io(0) << 8;
-	len = enc28j60_io(0);
-	len |= enc28j60_io(0) << 8;
-	stat = enc28j60_io(0);
-	stat |= enc28j60_io(0) << 8;
-	enc28j60_cs(1);
-
-	if (len < 6 + 6 + 2 + 4) {
-		return -1;
-	}
-
-	return len - 4;
+	// ESTAT bit 3 is unimplemented and reads as zero on the controller.
+	return (read_control(ESTAT, false) & (0x08 | ESTAT_CLKRDY)) == ESTAT_CLKRDY;
 }
 
-static void enc28j60_set_rx_read_pointer(uint16_t next)
+static void release_rx_packet(uint16_t next)
 {
 	// Errata item 14 requires ERXRDPT to contain an odd address.
-	uint16_t read_pointer = next == RXST_INIT ? RXND_INIT : next - 1;
-	enc28j60_write_control(ERXRDPTL, read_pointer & 0xff);
-	enc28j60_write_control(ERXRDPTH, read_pointer >> 8);
+	write_control16(ERXRDPTL, next == RXST_INIT ? RXND_INIT : next - 1);
+	next_packet = next;
+	bit_set(ECON2, ECON2_PKTDEC);
 }
 
-void enc28j60_recv_packet(uint8_t *ptr, int maxlen)
+static uint16_t read_buffer16(void)
 {
-	int i;
-	uint16_t next;
-	uint16_t len;
-	uint16_t stat;
+	uint16_t low = enc28j60_io(0);
+	return low | ((uint16_t)enc28j60_io(0) << 8);
+}
 
-	enc28j60_select_bank(0);
-	enc28j60_write_control(ERDPTL, _enc28j60_next_packet_ptr & 0xff);
-	enc28j60_write_control(ERDPTH, _enc28j60_next_packet_ptr >> 8);
-
-	enc28j60_cs(0);
-	enc28j60_io(0x3a);
-	next = enc28j60_io(0);
-	next |= enc28j60_io(0) << 8;
-	len = enc28j60_io(0);
-	len |= enc28j60_io(0) << 8;
-	stat = enc28j60_io(0);
-	stat |= enc28j60_io(0) << 8;
-	if (len < 4) {
-		len = 0;
-	} else {
-		len -= 4;
-		for (i = 0; i < len; i++) {
-			uint8_t c = enc28j60_io(0);
-			if (i < maxlen) {
-				ptr[i] = c;
-			}
+bool eth_init(uint8_t const *macaddr)
+{
+	enc28j60_init_io();
+	reset();
+	sleep_ms(1);
+	uint64_t deadline = time_us_64() + CONTROLLER_TIMEOUT_US;
+	while (!controller_ready()) {
+		if (time_us_64() >= deadline) {
+			return false;
 		}
 	}
-	enc28j60_cs(1);
 
-	enc28j60_set_rx_read_pointer(next);
-	_enc28j60_next_packet_ptr = next;
+	select_bank(0);
+	next_packet = RXST_INIT;
+	write_control16(ETXSTL, TXST_INIT);
+	write_control16(ETXNDL, TXST_INIT);
+	write_control16(ERXSTL, RXST_INIT);
+	write_control16(ERXNDL, RXND_INIT);
+	write_control16(ERXRDPTL, RXND_INIT);
 
-	enc28j60_bit_set(ECON2, 0x40); // set PKTDEC
+	select_bank(2);
+	write_control(MACON1, 0x0d);
+	write_control(MACON3, 0x33);
+	write_control(MACON4, 0x00);
+	write_control16(MAMXFLL, MAX_FRAME_SIZE);
+	write_control(MABBIPG, 0x15);
+	write_control(MAIPGL, 0x12);
+	write_control(MAIPGH, 0x0c);
+
+	select_bank(3);
+	write_control(MAADR1, macaddr[0]);
+	write_control(MAADR2, macaddr[1]);
+	write_control(MAADR3, macaddr[2]);
+	write_control(MAADR4, macaddr[3]);
+	write_control(MAADR5, macaddr[4]);
+	write_control(MAADR6, macaddr[5]);
+
+	if (!write_phy(PHCON1, 0x0100) || !write_phy(PHLCON, 0x0742)) {
+		return false;
+	}
+	bit_set(ECON1, ECON1_RXEN);
+	return true;
 }
 
-void enc28j60_drop_packet()
+int eth_link_status(void)
 {
-	uint16_t next;
+	uint16_t status;
+	if (!controller_ready() || !read_phy(PHSTAT2, &status)) {
+		return -1;
+	}
+	return (status & PHSTAT2_LSTAT) != 0;
+}
 
-	enc28j60_select_bank(0);
-	enc28j60_write_control(ERDPTL, _enc28j60_next_packet_ptr & 0xff);
-	enc28j60_write_control(ERDPTH, _enc28j60_next_packet_ptr >> 8);
-
+int eth_recv_packet(void *ptr, int maxlen)
+{
+	select_bank(1);
+	if (read_control(EPKTCNT, false) == 0) {
+		return 0;
+	}
+	select_bank(0);
+	write_control16(ERDPTL, next_packet);
 	enc28j60_cs(0);
 	enc28j60_io(0x3a);
-	next = enc28j60_io(0);
-	next |= enc28j60_io(0) << 8;
+	uint16_t next = read_buffer16();
+	uint16_t length_with_fcs = read_buffer16();
+	uint16_t status = read_buffer16();
+	if (next > RXND_INIT || (next & 1) || next == next_packet) {
+		enc28j60_cs(1);
+		return -1;
+	}
+	int length = (int)length_with_fcs - ETHERNET_FCS_SIZE;
+	if (!(status & RX_STATUS_OK) || length_with_fcs > MAX_FRAME_SIZE ||
+			length < ETHERNET_HEADER_SIZE || length > maxlen) {
+		enc28j60_cs(1);
+		release_rx_packet(next);
+		return 0;
+	}
+	uint8_t *data = ptr;
+	for (int i = 0; i < length; ++i) {
+		data[i] = enc28j60_io(0);
+	}
 	enc28j60_cs(1);
-
-	enc28j60_set_rx_read_pointer(next);
-	_enc28j60_next_packet_ptr = next;
-
-	enc28j60_bit_set(ECON2, 0x40); // set PKTDEC
+	release_rx_packet(next);
+	return length;
 }
 
-void enc28j60_init(uint8_t const *macaddr)
+static void reset_transmitter(void)
 {
-	int max_frame_size = MAX_FRAME_SIZE;
-
-	enc28j60_init_io();
-	enc28j60_reset();
-	sleep_ms(1);
-
-	while (!(enc28j60_read_control_e(ESTAT) & 0x01)); // while ESTAT.CLKRDY == 0
-
-	_enc28j60_next_packet_ptr = RXST_INIT;
-
-	// initialize buffer
-	enc28j60_write_control(ETXSTL, TXST_INIT & 0xff);
-	enc28j60_write_control(ETXSTH, TXST_INIT >> 8);
-	enc28j60_write_control(ETXNDL, TXST_INIT & 0xff);
-	enc28j60_write_control(ETXNDH, TXST_INIT >> 8);
-	enc28j60_write_control(ERXSTL, RXST_INIT & 0xff);
-	enc28j60_write_control(ERXSTH, RXST_INIT >> 8);
-	enc28j60_write_control(ERXNDL, RXND_INIT & 0xff);
-	enc28j60_write_control(ERXNDH, RXND_INIT >> 8);
-
-	enc28j60_set_rx_read_pointer(_enc28j60_next_packet_ptr);
-
-	// initialize MAC
-	enc28j60_select_bank(2);
-	enc28j60_write_control(MACON1, 0x0d);
-	enc28j60_write_control(MACON3, 0x33);
-	enc28j60_write_control(MACON4, 0x00);
-	enc28j60_write_control(MAMXFLL, max_frame_size & 0xff);
-	enc28j60_write_control(MAMXFLH, max_frame_size >> 8);
-	enc28j60_write_control(MABBIPG, 0x15);
-	enc28j60_write_control(MAIPGL, 0x12);
-	enc28j60_write_control(MAIPGH, 0x0c);
-
-	// initialize address
-	enc28j60_select_bank(3);
-	enc28j60_write_control(MAADR1, macaddr[0]);
-	enc28j60_write_control(MAADR2, macaddr[1]);
-	enc28j60_write_control(MAADR3, macaddr[2]);
-	enc28j60_write_control(MAADR4, macaddr[3]);
-	enc28j60_write_control(MAADR5, macaddr[4]);
-	enc28j60_write_control(MAADR6, macaddr[5]);
-
-	// initialize PHY
-	enc28j60_write_phy(PHCON1, 0x0100); // PDPXMD
-	enc28j60_write_phy(PHLCON, 0x0742);
-
-	//
-	enc28j60_bit_set(ECON1, 0x04); // set RXEN
+	bit_clear(ECON1, ECON1_TXRTS);
+	bit_set(ECON1, ECON1_TXRST);
+	bit_clear(ECON1, ECON1_TXRST);
+	bit_clear(EIR, EIR_TXIF | EIR_TXERIF);
 }
 
-void eth_init(uint8_t const *macaddr)
+bool eth_send_packet(void const *ptr, unsigned int len)
 {
-	enc28j60_init(macaddr);
-}
-
-unsigned int eth_recv_packet(void *ptr, int maxlen)
-{
-	int len = enc28j60_peek_packet();
-	if (len == 0) {
-		return 0;
+	if (len < ETHERNET_HEADER_SIZE || len > MAX_FRAME_SIZE - ETHERNET_FCS_SIZE) {
+		return false;
 	}
-	if (len < 0) {
-		enc28j60_drop_packet();
-		return 0;
+
+	select_bank(0);
+	if ((read_control(ECON1, false) & ECON1_TXRTS) ||
+			(read_control(EIR, false) & EIR_TXERIF)) {
+		reset_transmitter();
 	}
-	enc28j60_recv_packet((uint8_t *)ptr, maxlen);
-	return len;
-}
+	write_control16(EWRPTL, TXST_INIT);
+	write_control16(ETXNDL, TXST_INIT + len);
 
-void eth_send_packet(void const *ptr, unsigned int len)
-{
-	enc28j60_send_packet((uint8_t const *)ptr, len);
-}
+	uint8_t const *data = ptr;
+	enc28j60_cs(0);
+	enc28j60_io(0x7a);
+	enc28j60_io(0);
+	for (unsigned i = 0; i < len; ++i) {
+		enc28j60_io(data[i]);
+	}
+	enc28j60_cs(1);
+	bit_clear(ESTAT, ESTAT_TXABRT);
+	bit_clear(EIR, EIR_TXIF | EIR_TXERIF);
+	bit_set(ECON1, ECON1_TXRTS);
 
+	uint64_t deadline = time_us_64() + CONTROLLER_TIMEOUT_US;
+	do {
+		uint8_t flags = read_control(EIR, false);
+		if (flags & EIR_TXERIF) {
+			break;
+		}
+		if (flags & EIR_TXIF) {
+			if (!(read_control(ESTAT, false) & ESTAT_TXABRT)) {
+				return true;
+			}
+			break;
+		}
+	} while (time_us_64() < deadline);
+
+	reset_transmitter();
+	return false;
+}

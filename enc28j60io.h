@@ -6,8 +6,8 @@
 #ifndef ENC28J60IO_H
 #define ENC28J60IO_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
