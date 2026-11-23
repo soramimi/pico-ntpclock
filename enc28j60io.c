@@ -21,8 +21,8 @@ uint32_t milliseconds()
 
 void enc28j60_init_io()
 {
-	spi_init(SPI_PORT, 40 * 1000 * 1000);
-	spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
+	spi_init(SPI_PORT, 20 * 1000 * 1000);
+	spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 	gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
 	gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
 	gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);

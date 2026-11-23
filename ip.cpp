@@ -7,8 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "pico/rand.h"
 #include "pico/stdlib.h"
-#include <vector>
 
 #define MAX_FRAME_SIZE 1518
 
@@ -20,16 +20,6 @@ uint16_t ntohs(uint16_t v)
 uint16_t htons(uint16_t v)
 {
 	return ((v << 8) & 0xff00) | ((v >> 8) & 0x00ff);
-}
-
-uint32_t ntohl(uint32_t v)
-{
-	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff0000) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
-}
-
-uint32_t htonl(uint32_t v)
-{
-	return ((v << 24) & 0xff000000) | ((v << 8) & 0x00ff0000) | ((v >> 8) & 0x0000ff00) | ((v >> 24) & 0x000000ff);
 }
 
 //
@@ -144,9 +134,36 @@ struct dns_cache_item_t {
 	char name[1];
 };
 
+enum tcp_state_t : uint8_t {
+	TCP_CLOSED,
+	TCP_SYN_RECEIVED,
+	TCP_ESTABLISHED,
+	TCP_FIN_SENT,
+	TCP_TIME_WAIT,
+};
+
+struct tcp_peer_t {
+	uint32_t address;
+	uint16_t port;
+	uint8_t mac[6];
+};
+
 struct tcp_connection_t {
-	uint16_t port = 0;
-	bool fin = false;
+	tcp_peer_t peer;
+	uint32_t receive_next;
+	uint32_t send_next;
+	uint32_t send_unacknowledged;
+	uint32_t last_activity;
+	uint32_t last_send;
+	char const *response;
+	uint16_t response_length;
+	tcp_state_t state;
+	uint8_t retries;
+	uint8_t header_end;
+	uint8_t request_line_length;
+	bool peer_fin;
+	bool request_line_complete;
+	char request_line[64];
 };
 
 struct eth_ip_tcp_frame_t {
@@ -159,13 +176,6 @@ struct eth_ip_udp_frame_t {
 	struct ethernet_frame_t eth;
 	struct ip_frame_t ip;
 	struct udp_frame_t udp;
-}  __attribute__ ((packed));
-
-struct tcp_send_packet_t {
-	tcp_send_packet_t *next;
-	int size;
-	struct eth_ip_tcp_frame_t frame;
-	uint8_t data[1];
 }  __attribute__ ((packed));
 
 struct ip_stack_globals_t {
@@ -183,8 +193,7 @@ struct ip_stack_globals_t {
 	uint16_t udp_packet_count;
 	int dhcp_ack_waiting;
 	int state;
-	std::vector<tcp_connection_t> tcp_connections;
-	struct tcp_send_packet_t *tcp_send_packets = NULL;
+	tcp_connection_t tcp_connections[16];
 } ip_stack_globals;
 
 
@@ -205,7 +214,6 @@ void ip_stack_init(uint8_t const *macaddr)
 		ip_stack_globals.udp_packets[i] = 0;
 	}
 	ip_stack_globals.udp_packet_count = 0;
-//	tcp_send_packets = NULL;
 	eth_init(ip_stack_globals.mac_addr);
 	sleep_ms(100);
 }
@@ -278,21 +286,8 @@ void set_ip_checksum(struct ip_frame_t *ip)
 	write_s(&ip->checksum, sum);
 }
 
-void set_checksum_(struct ip_frame_t const *ip, int len)
+static uint16_t transport_checksum(struct ip_frame_t const *ip, void const *segment, uint16_t len)
 {
-	struct tcp_frame_t *tcp = NULL;
-	struct udp_frame_t *udp = NULL;
-	if (ip->protocol == 6) { // TCP
-		tcp = (struct tcp_frame_t *)((uint8_t *)ip + sizeof(struct ip_frame_t));
-		tcp->checksum = 0;
-	} else if (ip->protocol == 17) { // UDP
-		udp = (struct udp_frame_t *)((uint8_t *)ip + sizeof(struct ip_frame_t));
-		len = ntohs(udp->length);
-		udp->checksum = 0;
-	} else {
-		return;
-	}
-
 	struct {
 		uint32_t src;
 		uint32_t dst;
@@ -300,35 +295,22 @@ void set_checksum_(struct ip_frame_t const *ip, int len)
 		uint8_t protocol;
 		uint16_t length;
 	} header;
-	uint16_t sum;
-
 	header.src = ip->src;
 	header.dst = ip->dst;
 	header.zero = 0;
 	header.protocol = ip->protocol;
 	write_s(&header.length, len);
 
-	sum = compute_sum(0, &header, sizeof(header));
-	if (tcp) sum = compute_sum(sum, tcp, len);
-	if (udp) sum = compute_sum(sum, udp, len);
-
-	sum = ~sum;
-	if (sum == 0) {
-		sum = 0xffff;
-	}
-
-	if (tcp) write_s(&tcp->checksum, sum);
-	if (udp) write_s(&udp->checksum, sum);
+	uint16_t sum = compute_sum(0, &header, sizeof(header));
+	return ~compute_sum(sum, segment, len);
 }
 
-void set_tcp_checksum(struct ip_frame_t const *ip, int len)
+void set_udp_checksum(struct ip_frame_t *ip)
 {
-	set_checksum_(ip, len);
-}
-
-void set_udp_checksum(struct ip_frame_t const *ip)
-{
-	set_checksum_(ip, 0);
+	struct udp_frame_t *udp = (struct udp_frame_t *)(ip + 1);
+	udp->checksum = 0;
+	uint16_t checksum = transport_checksum(ip, udp, read_s(&udp->length));
+	write_s(&udp->checksum, checksum ? checksum : 0xffff);
 }
 
 void set_icmp_checksum(struct icmp_frame_t *icmp, struct ip_frame_t const *ip)
@@ -613,9 +595,10 @@ void send_arp_response(struct arp_frame_t const *arp)
 
 //
 
-void send_icmp_echo_reply(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip, struct icmp_frame_t const *icmp)
+void send_icmp_echo_reply(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip, struct icmp_frame_t const *icmp, int icmp_length)
 {
-	uint8_t tmp[MAX_FRAME_SIZE];
+	// Sending directly at the Ethernet layer does not re-enter packet processing.
+	static uint8_t tmp[MAX_FRAME_SIZE];
 	struct frame_t {
 		struct ethernet_frame_t eth;
 		struct ip_frame_t ip;
@@ -624,7 +607,7 @@ void send_icmp_echo_reply(struct ethernet_frame_t const *eth, struct ip_frame_t 
 
 	frame = (struct frame_t *)tmp;
 
-	memset(tmp, 0, sizeof(tmp));
+	memset(frame, 0, sizeof(*frame));
 
 	memcpy(frame->eth.dst, eth->src, 6);
 	memcpy(frame->eth.src, ip_stack_globals.mac_addr, 6);
@@ -636,13 +619,8 @@ void send_icmp_echo_reply(struct ethernet_frame_t const *eth, struct ip_frame_t 
 	memcpy(&frame->ip.src, ip_stack_globals.ipv4_addr, 4);
 
 	uint8_t *p = (uint8_t *)&frame->icmp;
-	uint16_t ip_total_length = read_s(&ip->total_length);
-	if (ip_total_length >= sizeof(struct ip_frame_t) && sizeof(struct ethernet_frame_t) + ip_total_length <= MAX_FRAME_SIZE) {
-		memcpy(p, icmp, ip_total_length - sizeof(struct ip_frame_t));
-		p += ip_total_length;
-	} else {
-		p += sizeof(struct icmp_frame_t);
-	}
+	memcpy(p, icmp, icmp_length);
+	p += icmp_length;
 
 	frame->icmp.type = 0; // reply
 
@@ -666,12 +644,17 @@ void ip_stack_term()
 	}
 }
 
-void on_icmp_packet(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip, uint8_t *p, bool broadcast)
+void on_icmp_packet(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip, uint8_t *p, int len)
 {
-	struct icmp_frame_t *icmp = (struct icmp_frame_t *)p;
-	if (icmp->type == 8) { // echo request
-		send_icmp_echo_reply(eth, ip, icmp);
+	int header_length = (ip->version_and_length & 0x0f) * 4;
+	int total_length = read_s(&ip->total_length);
+	int icmp_length = total_length - header_length;
+	if (header_length < (int)sizeof(*ip) || total_length > len || icmp_length < (int)sizeof(struct icmp_frame_t)) {
 		return;
+	}
+	struct icmp_frame_t const *icmp = (struct icmp_frame_t const *)p;
+	if (icmp->type == 8) { // echo request
+		send_icmp_echo_reply(eth, ip, icmp, icmp_length);
 	}
 }
 
@@ -705,10 +688,18 @@ void process_dhcp_options(struct dhcp_frame_t *dhcp, uint8_t const *begin, uint8
 	memset(subnet_mask, 0, 4);
 	memset(gateway_addr, 0, 4);
 	memset(dns_addr, 0, 4);
-	while (p + 1 < end && p[0] != 0xff && p + 2 + p[1] <= end) {
-		uint8_t option = p[0];
-		uint8_t len = p[1];
-		p += 2;
+	while (p < end) {
+		uint8_t option = *p++;
+		if (option == 0) { // Pad has no length byte.
+			continue;
+		}
+		if (option == 0xff || p == end) {
+			break;
+		}
+		uint8_t len = *p++;
+		if (end - p < len) {
+			break;
+		}
 		switch (option) {
 		case 53: // dhcp message type
 			if (len == 1) {
@@ -727,8 +718,6 @@ void process_dhcp_options(struct dhcp_frame_t *dhcp, uint8_t const *begin, uint8
 					if (ip_stack_globals.state == STATE_SENT_DHCP_DISCOVER && ip_stack_globals.dhcp_ack_waiting > 0) {
 						dhcp_ack = true;
 					}
-					ip_stack_globals.state = STATE_IDLE;
-					ip_stack_globals.dhcp_ack_waiting = 0;
 				} else if (p[0] == 6) { // nack
 					ip_stack_globals.state = STATE_DHCP_NACK;
 					ip_stack_globals.dhcp_ack_waiting = 0;
@@ -746,12 +735,12 @@ void process_dhcp_options(struct dhcp_frame_t *dhcp, uint8_t const *begin, uint8
 			}
 			break;
 		case 3: // default gateway
-			if (len == 4) {
+			if (len >= 4 && len % 4 == 0) {
 				memcpy(gateway_addr, p, 4);
 			}
 			break;
 		case 6: // DNS
-			if (len == 4) {
+			if (len >= 4 && len % 4 == 0) {
 				memcpy(dns_addr, p, 4);
 			}
 			break;
@@ -762,11 +751,13 @@ void process_dhcp_options(struct dhcp_frame_t *dhcp, uint8_t const *begin, uint8
 		send_dhcp_request(dhcp);
 		ip_stack_globals.dhcp_ack_waiting = 1;
 	}
-	if (dhcp_ack) {
+	if (dhcp_ack && dhcp->user_ip_addr != 0 && !is_addr_zero(subnet_mask) && !is_addr_zero(dns_addr)) {
 		memcpy(ip_stack_globals.ipv4_addr, &dhcp->user_ip_addr, 4);
 		memcpy(ip_stack_globals.subnet_mask, subnet_mask, 4);
 		memcpy(ip_stack_globals.gateway_addr, gateway_addr, 4);
 		memcpy(ip_stack_globals.dns_addr, dns_addr, 4);
+		ip_stack_globals.state = STATE_IDLE;
+		ip_stack_globals.dhcp_ack_waiting = 0;
 	}
 }
 
@@ -821,7 +812,7 @@ void process_dns_response(struct dns_frame_t const *dns, uint8_t const *end)
 				datalen = read_s((uint16_t const *)p);
 				p += 2;
 				if (type == 1 && !host_addr_is_valid) { // A
-					if (datalen == 4 && p + datalen < end) {
+					if (datalen == 4 && end - p >= datalen) {
 						memcpy(host_addr, p, 4);
 						host_addr_is_valid = true;
 					}
@@ -970,10 +961,7 @@ bool send_ip_packet(uint8_t *packet, int length)
 
 	set_ip_identifier(&frame->ip);
 
-	if (frame->ip.protocol == 6) { // TCP
-		int n = length - (sizeof(struct ethernet_frame_t) + sizeof(struct ip_frame_t));
-		set_tcp_checksum(&frame->ip, n);
-	} else if (frame->ip.protocol == 17) { // UDP
+	if (frame->ip.protocol == 17) { // UDP
 		set_udp_checksum(&frame->ip);
 	}
 
@@ -993,6 +981,7 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 		return false;
 	}
 
+	memset(tmp, 0, sizeof(struct eth_ip_udp_frame_t));
 	uint8_t *p = tmp + sizeof(struct eth_ip_udp_frame_t);
 	memcpy(p, ptr, len);
 	p += len;
@@ -1002,129 +991,301 @@ bool send_udp_packet(uint8_t const *dstipv4, uint16_t dstport, uint16_t srcport,
 	return send_ip_packet(tmp, p - tmp);
 }
 
-struct tcp_send_packet_t *alloc_tcp_packet(struct eth_ip_tcp_frame_t *eth, int datalen, uint8_t flags)
+static constexpr uint16_t HTTP_PORT = 80;
+static constexpr char HTTP_OK[] = "HTTP/1.1 200 OK\r\n"
+	"Content-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nConnection: close\r\n\r\n"
+	"Hello, world!\n";
+static constexpr char HTTP_NOT_FOUND[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static constexpr unsigned HTTP_MAX_RESPONSE_SIZE =
+	(sizeof(HTTP_OK) > sizeof(HTTP_NOT_FOUND) ? sizeof(HTTP_OK) : sizeof(HTTP_NOT_FOUND)) - 1;
+static constexpr uint32_t TCP_RETRY_MS = 1000;
+static constexpr uint32_t TCP_IDLE_MS = 30000;
+static constexpr uint32_t TCP_TIME_WAIT_MS = 120000;
+
+enum : uint16_t {
+	TCP_FIN = 0x01,
+	TCP_SYN = 0x02,
+	TCP_RST = 0x04,
+	TCP_PSH = 0x08,
+	TCP_ACK = 0x10,
+};
+
+static bool tcp_sequence_before(uint32_t a, uint32_t b)
 {
-	tcp_send_packet_t *p = (tcp_send_packet_t *)malloc(sizeof(tcp_send_packet_t) + datalen);
-	memset(p, 0, sizeof(tcp_send_packet_t) + datalen);
-	prepare_ip_packet(&p->frame.ip, nullptr);
-	p->frame.ip.protocol = 6; // TCP
-	write_s(&p->frame.ip.flags_and_fragment_offset, 0x4000);
-	p->frame.ip.dst = eth->ip.src;
-	write_s(&p->frame.tcp.flags, (sizeof(p->frame.tcp) << 10) | flags);
-	p->frame.tcp.src_port = eth->tcp.dst_port;
-	p->frame.tcp.dst_port = eth->tcp.src_port;
-	p->frame.tcp.sequence_number = eth->tcp.acknowledgment_number;
-	p->frame.tcp.acknowledgment_number = htonl(ntohl(eth->tcp.sequence_number) + 1);
-	write_s(&p->frame.tcp.window_size_value, 10000);
-	p->frame.tcp.urgent_pointer = 0;
-
-	p->size = ((uint8_t *)&p->frame.tcp + sizeof(p->frame.tcp) + datalen) - (uint8_t *)&p->frame;
-
-	tcp_connection_t conn;
-	conn.port = ntohs(eth->tcp.dst_port);
-	conn.fin = false;
-	ip_stack_globals.tcp_connections.push_back(conn);
-
-	return p;
+	return a - b > UINT32_MAX / 2;
 }
 
-void push_tcp_send_packet(tcp_send_packet_t *packet)
+static void send_tcp_segment(tcp_peer_t const &peer, uint32_t sequence, uint32_t acknowledgment,
+		uint16_t flags, char const *payload = nullptr, unsigned payload_length = 0)
 {
-	tcp_send_packet_t **p = &ip_stack_globals.tcp_send_packets;
-	while (*p) {
-		p = &(*p)->next;
+	uint8_t bytes[sizeof(eth_ip_tcp_frame_t) + HTTP_MAX_RESPONSE_SIZE] = {};
+	auto *frame = (struct eth_ip_tcp_frame_t *)bytes;
+	memcpy(frame->eth.dst, peer.mac, 6);
+	memcpy(frame->eth.src, ip_stack_globals.mac_addr, 6);
+	write_s(&frame->eth.type, 0x0800);
+
+	prepare_tcp_packet(frame, peer.address, peer.port, HTTP_PORT);
+	memcpy(&frame->ip.src, ip_stack_globals.ipv4_addr, 4);
+	write_s(&frame->ip.flags_and_fragment_offset, 0x4000);
+	write_s(&frame->tcp.flags, (sizeof(frame->tcp) << 10) | flags);
+	write_l(&frame->tcp.sequence_number, sequence);
+	write_l(&frame->tcp.acknowledgment_number, acknowledgment);
+	write_s(&frame->tcp.window_size_value, (flags & TCP_RST) ? 0 : 4096);
+	if (payload_length != 0) {
+		memcpy(bytes + sizeof(*frame), payload, payload_length);
 	}
-	*p = packet;
+
+	unsigned length = sizeof(*frame) + payload_length;
+	prepare_ip_packet(&frame->ip, bytes + length);
+	write_s(&frame->tcp.checksum, transport_checksum(&frame->ip, &frame->tcp, sizeof(frame->tcp) + payload_length));
+	set_ip_checksum(&frame->ip);
+	// The incoming Ethernet source is the next hop for this reply.
+	eth_send_packet(bytes, length);
 }
 
-void lcd_print_ipv4(uint32_t ipv4);
-
-tcp_connection_t *find_tcp_connection(eth_ip_tcp_frame_t *eth)
+static void send_tcp_ack(tcp_connection_t const &connection)
 {
-	for (tcp_connection_t &c : ip_stack_globals.tcp_connections) {
-		if (c.port == ntohs(eth->tcp.dst_port)) {
-			return &c;
+	send_tcp_segment(connection.peer, connection.send_next, connection.receive_next, TCP_ACK);
+}
+
+static void send_pending_tcp_segment(tcp_connection_t &connection, uint32_t now)
+{
+	connection.last_send = now;
+	if (connection.state == TCP_SYN_RECEIVED) {
+		send_tcp_segment(connection.peer, connection.send_unacknowledged, connection.receive_next, TCP_SYN | TCP_ACK);
+		return;
+	}
+
+	// An outstanding FIN occupies the last sequence number after the response.
+	unsigned remaining = connection.send_next - connection.send_unacknowledged - 1;
+	uint16_t flags = TCP_ACK | TCP_FIN;
+	char const *payload = nullptr;
+	if (remaining != 0) {
+		flags |= TCP_PSH;
+		payload = connection.response + (connection.response_length - remaining);
+	}
+	send_tcp_segment(connection.peer, connection.send_unacknowledged, connection.receive_next, flags, payload, remaining);
+}
+
+static tcp_connection_t *find_tcp_connection(tcp_peer_t const &peer)
+{
+	for (auto &connection : ip_stack_globals.tcp_connections) {
+		if (connection.state != TCP_CLOSED && connection.peer.address == peer.address && connection.peer.port == peer.port) {
+			return &connection;
 		}
 	}
 	return nullptr;
 }
 
-void toggle_led();
-
-void dispose_tcp_session(tcp_connection_t *conn)
+static void accept_tcp_connection(tcp_peer_t const &peer, uint32_t sequence, uint32_t now)
 {
-	if (conn) {
-		for (size_t i = 0; i < ip_stack_globals.tcp_connections.size(); i++) {
-			tcp_connection_t *c = &ip_stack_globals.tcp_connections[i];
-			if (c == conn) {
-				ip_stack_globals.tcp_connections.erase(ip_stack_globals.tcp_connections.begin() + i);
-				break;
+	tcp_connection_t *slot = nullptr;
+	for (auto &connection : ip_stack_globals.tcp_connections) {
+		if (connection.state == TCP_CLOSED) {
+			slot = &connection;
+			break;
+		}
+		if (connection.state == TCP_TIME_WAIT && (!slot || now - connection.last_activity > now - slot->last_activity)) {
+			slot = &connection;
+		}
+	}
+	if (!slot) {
+		return;
+	}
+
+	*slot = {};
+	slot->peer = peer;
+	slot->state = TCP_SYN_RECEIVED;
+	slot->receive_next = sequence + 1;
+	slot->send_unacknowledged = get_rand_32();
+	slot->send_next = slot->send_unacknowledged + 1;
+	slot->last_activity = now;
+	send_pending_tcp_segment(*slot, now);
+}
+
+static void select_http_response(tcp_connection_t &connection)
+{
+	connection.response = HTTP_NOT_FOUND;
+	connection.response_length = sizeof(HTTP_NOT_FOUND) - 1;
+	char const *method_end = strchr(connection.request_line, ' ');
+	if (!method_end) {
+		return;
+	}
+
+	char const *path = method_end + 1;
+	size_t path_length = strcspn(path, " ?");
+	static constexpr char index_path[] = "/index.html";
+	bool root = path_length == 1 && path[0] == '/';
+	bool index = path_length == sizeof(index_path) - 1 && memcmp(path, index_path, path_length) == 0;
+	if (path[path_length] == '\0' || !(root || index)) {
+		return;
+	}
+
+	connection.response = HTTP_OK;
+	connection.response_length = sizeof(HTTP_OK) - 1;
+	if (method_end - connection.request_line == 4 && memcmp(connection.request_line, "HEAD", 4) == 0) {
+		connection.response_length = strstr(HTTP_OK, "\r\n\r\n") - HTTP_OK + 4;
+	}
+}
+
+static void receive_http_headers(tcp_connection_t &connection, uint8_t const *data, unsigned length)
+{
+	static constexpr char end_of_headers[] = "\r\n\r\n";
+	for (unsigned i = 0; i < length; i++) {
+		uint8_t byte = data[i];
+		if (!connection.request_line_complete) {
+			if (byte == '\r' || byte == '\n') {
+				connection.request_line_complete = true;
+			} else if (connection.request_line_length < sizeof(connection.request_line) - 1) {
+				connection.request_line[connection.request_line_length++] = byte;
 			}
+		}
+		if (byte == end_of_headers[connection.header_end]) {
+			if (++connection.header_end == sizeof(end_of_headers) - 1) {
+				select_http_response(connection);
+				return;
+			}
+		} else {
+			connection.header_end = byte == '\r' ? 1 : 0;
 		}
 	}
 }
 
-void on_tcp_packet(struct eth_ip_tcp_frame_t *eth, uint8_t *data, int size)
+static void on_tcp_packet(struct ethernet_frame_t const *eth, struct ip_frame_t const *ip,
+		uint8_t const *segment, unsigned segment_length)
 {
-	uint16_t flags = read_s(&eth->tcp.flags);
-	uint8_t len = flags >> 10;
-	uint8_t const *end = (uint8_t const *)&eth->tcp;
-	end += len;
-	if (flags & 0x0004) { // RST
-		tcp_connection_t *conn = find_tcp_connection(eth);
-		dispose_tcp_session(conn);
-		return; // true
+	if (segment_length < sizeof(struct tcp_frame_t)) {
+		return;
+	}
+	auto *tcp = (struct tcp_frame_t const *)segment;
+	if (read_s(&tcp->dst_port) != HTTP_PORT || transport_checksum(ip, segment, segment_length) != 0) {
+		return;
+	}
+	uint16_t flags = read_s(&tcp->flags);
+	unsigned header_length = (flags >> 12) * 4;
+	if (header_length < sizeof(*tcp) || header_length > segment_length) {
+		return;
 	}
 
-	if ((flags & 0x0017) == 0x0002) { // SYN
+	uint8_t const *data = segment + header_length;
+	unsigned data_length = segment_length - header_length;
+	tcp_peer_t peer = {ip->src, read_s(&tcp->src_port), {}};
+	memcpy(peer.mac, eth->src, 6);
 
-		if (sizeof(struct eth_ip_udp_frame_t) + len > MAX_FRAME_SIZE) {
-			return; // false
+	uint32_t sequence = read_l(&tcp->sequence_number);
+	uint32_t acknowledgment = read_l(&tcp->acknowledgment_number);
+	bool fin = (flags & TCP_FIN) != 0;
+	bool opening = (flags & (TCP_SYN | TCP_FIN | TCP_RST | TCP_ACK)) == TCP_SYN;
+	uint32_t now = milliseconds();
+	tcp_connection_t *connection = find_tcp_connection(peer);
+
+	if (!connection) {
+		if (opening) {
+			accept_tcp_connection(peer, sequence, now);
+		} else if (!(flags & TCP_RST)) {
+			if (flags & TCP_ACK) {
+				send_tcp_segment(peer, acknowledgment, 0, TCP_RST);
+			} else {
+				uint32_t next = sequence + data_length + ((flags & TCP_SYN) != 0) + fin;
+				send_tcp_segment(peer, 0, next, TCP_RST | TCP_ACK);
+			}
 		}
-
-		tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x12); // SYN ACK
-		push_tcp_send_packet(p);
-		return; // true
+		return;
 	}
-	if ((flags & 0x0017) == 0x0010) { // ACK
 
-		tcp_connection_t *conn = find_tcp_connection(eth);
-		if (conn) {
-			if (conn->fin) {
-				dispose_tcp_session(conn);
-				return; // true
-			}
-			if (memcmp(data, "GET ", 4) == 0) {
-				static char const *msg = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
-				int datalen = strlen(msg);
+	if (connection->state == TCP_TIME_WAIT) {
+		if (!(flags & TCP_RST) && fin && sequence + data_length + 1 == connection->receive_next) {
+			connection->last_activity = now;
+			send_tcp_ack(*connection);
+		}
+		return;
+	}
 
-				tcp_send_packet_t *p = alloc_tcp_packet(eth, datalen, 0x10); // ACK
-				memcpy(p->data, msg, datalen);
+	if (flags & TCP_RST) {
+		if (sequence == connection->receive_next) {
+			connection->state = TCP_CLOSED;
+		}
+		return;
+	}
 
-				push_tcp_send_packet(p);
-				return; // true
-			}
+	if (connection->state == TCP_SYN_RECEIVED) {
+		if (opening && sequence + 1 == connection->receive_next) {
+			send_pending_tcp_segment(*connection, now);
+			return;
+		}
+		if (!(flags & TCP_ACK) || (flags & TCP_SYN) || acknowledgment != connection->send_next ||
+				sequence != connection->receive_next) {
+			return;
+		}
+		connection->state = TCP_ESTABLISHED;
+	}
 
-		} else {
-			return; // false
+	if (!(flags & TCP_ACK) || (flags & TCP_SYN)) {
+		return;
+	}
+
+	uint32_t overlap = connection->receive_next - sequence;
+	if (overlap > data_length || (overlap != 0 && overlap == data_length && !fin) ||
+			tcp_sequence_before(connection->send_next, acknowledgment)) {
+		if (data_length != 0 || fin || sequence == connection->receive_next || tcp_sequence_before(connection->receive_next, sequence)) {
+			send_tcp_ack(*connection);
+		}
+		return;
+	}
+
+	connection->peer = peer;
+	connection->last_activity = now;
+	if (tcp_sequence_before(connection->send_unacknowledged, acknowledgment)) {
+		connection->send_unacknowledged = acknowledgment;
+		connection->retries = 0;
+	}
+
+	data += overlap;
+	data_length -= overlap;
+	bool acknowledge_data = data_length != 0 || fin;
+	if (!connection->peer_fin) {
+		connection->receive_next += data_length + fin;
+		connection->peer_fin = fin;
+		if (connection->state == TCP_ESTABLISHED) {
+			receive_http_headers(*connection, data, data_length);
 		}
 	}
-	if ((flags & 0x0017) == 0x0011) { // FIN ACK
-		tcp_connection_t *conn = find_tcp_connection(eth);
-		if (conn) {
-			{
-				tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x10); // ACK
-				push_tcp_send_packet(p);
+
+	if (connection->state == TCP_ESTABLISHED && (connection->response || connection->peer_fin)) {
+		connection->state = TCP_FIN_SENT;
+		connection->send_next += connection->response_length + 1;
+		send_pending_tcp_segment(*connection, now);
+		return;
+	}
+	if (acknowledge_data) {
+		send_tcp_ack(*connection);
+	}
+	if (connection->state == TCP_FIN_SENT && connection->peer_fin && connection->send_unacknowledged == connection->send_next) {
+		connection->state = TCP_TIME_WAIT;
+	}
+}
+
+static void process_tcp_timers()
+{
+	uint32_t now = milliseconds();
+	for (auto &connection : ip_stack_globals.tcp_connections) {
+		if (connection.state == TCP_CLOSED) {
+			continue;
+		}
+		uint32_t idle_limit = connection.state == TCP_TIME_WAIT ? TCP_TIME_WAIT_MS : TCP_IDLE_MS;
+		if (now - connection.last_activity >= idle_limit) {
+			connection.state = TCP_CLOSED;
+			continue;
+		}
+		if (connection.send_unacknowledged != connection.send_next && now - connection.last_send >= TCP_RETRY_MS) {
+			if (connection.retries == 4) {
+				connection.state = TCP_CLOSED;
+				continue;
 			}
-			if (!conn->fin) {
-				tcp_send_packet_t *p = alloc_tcp_packet(eth, 0, 0x11); // FIN ACK
-				push_tcp_send_packet(p);
-				conn->fin = true;
-			}
-			return; // true
+			connection.retries++;
+			send_pending_tcp_segment(connection, now);
 		}
 	}
-	return; // false
 }
 
 void on_udp_packet(struct ip_frame_t const *ip, uint8_t *p, bool broadcast)
@@ -1161,15 +1322,24 @@ void on_udp_packet(struct ip_frame_t const *ip, uint8_t *p, bool broadcast)
 
 void eth_on_ip_packet(uint8_t *buf, int len, bool broadcast)
 {
+	int ip_length = len - (int)sizeof(struct ethernet_frame_t);
+	if (ip_length < (int)sizeof(struct ip_frame_t)) {
+		return;
+	}
 	struct ip_frame_t *ip = (struct ip_frame_t *)(buf + sizeof(struct ethernet_frame_t));
 	if ((ip->version_and_length & 0xf0) == 0x40) {
-		uint8_t *p = (uint8_t *)ip;
-		p += (ip->version_and_length & 0x0f) * 4;
+		int header_length = (ip->version_and_length & 0x0f) * 4;
+		if (header_length < (int)sizeof(*ip) || header_length > ip_length) {
+			return;
+		}
+		uint8_t *p = (uint8_t *)ip + header_length;
 		if (ip->protocol == 6) { // TCP
-			struct eth_ip_tcp_frame_t *eth = (struct eth_ip_tcp_frame_t *)buf;
-			uint8_t *data = buf + sizeof(struct eth_ip_tcp_frame_t);
-			int size = len - sizeof(struct eth_ip_tcp_frame_t);
-			on_tcp_packet(eth, data, size);
+			int total_length = read_s(&ip->total_length);
+			if (!broadcast && ip->dst != 0 && ip->dst == get_ip_address() &&
+					total_length >= header_length && total_length <= ip_length &&
+					!(read_s(&ip->flags_and_fragment_offset) & 0x3fff)) {
+				on_tcp_packet((struct ethernet_frame_t const *)buf, ip, p, total_length - header_length);
+			}
 			return;
 		}
 		if (ip->protocol == 17) { // UDP
@@ -1178,7 +1348,7 @@ void eth_on_ip_packet(uint8_t *buf, int len, bool broadcast)
 		}
 		if (ip->protocol == 1) { // ICMP
 			struct ethernet_frame_t const *eth = (struct ethernet_frame_t *)buf;
-			on_icmp_packet(eth, ip, p, broadcast);
+			on_icmp_packet(eth, ip, p, ip_length);
 			return;
 		}
 	}
@@ -1255,12 +1425,7 @@ void ip_stack_process()
 			continue;
 		}
 	}
-	tcp_send_packet_t *p = ip_stack_globals.tcp_send_packets;
-	if (p) {
-		ip_stack_globals.tcp_send_packets = p->next;
-		send_ip_packet((uint8_t *)&p->frame, p->size);
-		free(p);
-	}
+	process_tcp_timers();
 }
 
 void ip_config(uint8_t const *ipv4, uint8_t const *mask, uint8_t const *gateway, uint8_t const *dns)
@@ -1403,22 +1568,17 @@ bool query_dns(char const *name, uint8_t *ipv4)
 			if (retry >= 12) {
 				return false;
 			}
-			write_s(&item->transaction_id, ip_stack_globals.dns_transaction_id);
-			ip_stack_globals.dns_transaction_id++;
+			item->transaction_id = ip_stack_globals.dns_transaction_id++;
+			write_s(&frame->dns.transaction_id, item->transaction_id);
 			if (!send_ip_packet(tmp, packetlength)) {
 				return false;
 			}
 			tick = milliseconds();
 		}
 		ip_stack_process();
-		if (ip_stack_globals.state == STATE_IDLE) {
-			for (index = 0; index < DNS_CACHE_SIZE; index++) {
-				item = ip_stack_globals.dns_cache[index];
-				if (item && item->valid_address && strcmp(item->name, name) == 0) {
-					memcpy(ipv4, item->ipv4, 4);
-					return true;
-				}
-			}
+		if (ip_stack_globals.state == STATE_IDLE && item->valid_address) {
+			memcpy(ipv4, item->ipv4, 4);
+			return true;
 		}
 	}
 }

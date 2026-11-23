@@ -3,11 +3,14 @@ NAME=ntpclock
 PICO_SDK_PATH=~/pico/pico-sdk
 PICO ?= $(shell ../findpico.sh)
 
-all:
-	-mkdir build
-	cd build; NAME=$(NAME) PICO_SDK_PATH=$(PICO_SDK_PATH) cmake ..; make -j8
+.PHONY: all run clean mnt usb
 
-run:
+all:
+	mkdir -p build
+	cd build && NAME=$(NAME) PICO_SDK_PATH=$(PICO_SDK_PATH) cmake ..
+	$(MAKE) -C build -j8
+
+run: all
 	sudo cp build/$(NAME).uf2 /mnt/pico
 	sudo sync
 

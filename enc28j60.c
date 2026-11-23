@@ -8,6 +8,8 @@
 #include "enc28j60io.h"
 #include "ip.h"
 
+#define RXND_INIT (TXST_INIT - 1)
+
 uint16_t _enc28j60_next_packet_ptr;
 
 int enc28j60_read_control_e(int reg)
@@ -91,6 +93,7 @@ void enc28j60_write_phy(int reg, int val)
 	enc28j60_write_control(MIREGADR, reg);
 	enc28j60_write_control(MIWRL, val & 0xff);
 	enc28j60_write_control(MIWRH, val >> 8);
+	enc28j60_select_bank(3);
 	while (enc28j60_read_control_m(MISTAT) & 0x01);
 }
 
@@ -153,13 +156,19 @@ int enc28j60_peek_packet()
 	stat |= enc28j60_io(0) << 8;
 	enc28j60_cs(1);
 
-	if (len < 4) {//if (len < 6 + 6 + 2 + 4) {
-		len = -1;
-	} else {
-		len -= 4;
+	if (len < 6 + 6 + 2 + 4) {
+		return -1;
 	}
 
-	return len;
+	return len - 4;
+}
+
+static void enc28j60_set_rx_read_pointer(uint16_t next)
+{
+	// Errata item 14 requires ERXRDPT to contain an odd address.
+	uint16_t read_pointer = next == RXST_INIT ? RXND_INIT : next - 1;
+	enc28j60_write_control(ERXRDPTL, read_pointer & 0xff);
+	enc28j60_write_control(ERXRDPTH, read_pointer >> 8);
 }
 
 void enc28j60_recv_packet(uint8_t *ptr, int maxlen)
@@ -194,8 +203,7 @@ void enc28j60_recv_packet(uint8_t *ptr, int maxlen)
 	}
 	enc28j60_cs(1);
 
-	enc28j60_write_control(ERXRDPTL, next & 0xff);
-	enc28j60_write_control(ERXRDPTH, next >> 8);
+	enc28j60_set_rx_read_pointer(next);
 	_enc28j60_next_packet_ptr = next;
 
 	enc28j60_bit_set(ECON2, 0x40); // set PKTDEC
@@ -215,8 +223,7 @@ void enc28j60_drop_packet()
 	next |= enc28j60_io(0) << 8;
 	enc28j60_cs(1);
 
-	enc28j60_write_control(ERXRDPTL, next & 0xff);
-	enc28j60_write_control(ERXRDPTH, next >> 8);
+	enc28j60_set_rx_read_pointer(next);
 	_enc28j60_next_packet_ptr = next;
 
 	enc28j60_bit_set(ECON2, 0x40); // set PKTDEC
@@ -240,12 +247,11 @@ void enc28j60_init(uint8_t const *macaddr)
 	enc28j60_write_control(ETXNDL, TXST_INIT & 0xff);
 	enc28j60_write_control(ETXNDH, TXST_INIT >> 8);
 	enc28j60_write_control(ERXSTL, RXST_INIT & 0xff);
-	enc28j60_write_control(ERXSTH, RXST_INIT > 8);
-	enc28j60_write_control(ERXNDL, (TXST_INIT - 1) & 0xff);
-	enc28j60_write_control(ERXNDH, (TXST_INIT - 1) >> 8);
+	enc28j60_write_control(ERXSTH, RXST_INIT >> 8);
+	enc28j60_write_control(ERXNDL, RXND_INIT & 0xff);
+	enc28j60_write_control(ERXNDH, RXND_INIT >> 8);
 
-	enc28j60_write_control(ERXRDPTL, RXST_INIT & 0xff);
-	enc28j60_write_control(ERXRDPTH, RXST_INIT >> 8);
+	enc28j60_set_rx_read_pointer(_enc28j60_next_packet_ptr);
 
 	// initialize MAC
 	enc28j60_select_bank(2);
